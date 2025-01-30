@@ -580,7 +580,7 @@ impl ThreadLocalUnprocessedPackets {
         self.thread_type
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.unprocessed_packet_batches.len()
     }
 
