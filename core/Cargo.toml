@@ -159,6 +159,10 @@ name = "sigverify_stage"
 name="forwarder_test"
 harness=false
 
+[[bench]]
+name="transaction_scheduler"
+harness=false
+
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 

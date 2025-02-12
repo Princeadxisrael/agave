@@ -56,6 +56,7 @@ struct BenchSetup {
     stats: BankingStageStats,
     tracer_stats: TracerPacketStats,
 }
+//initialize a minimal validator environment
 fn setup(num_packets: usize, contentious_transaction: bool) -> BenchSetup {
     let validator_keypair = Arc::new(Keypair::new());
     let genesis_config_info = create_genesis_config_with_leader(
@@ -64,7 +65,8 @@ fn setup(num_packets: usize, contentious_transaction: bool) -> BenchSetup {
         bootstrap_validator_stake_lamports(),
     );
     let GenesisConfigInfo { genesis_config, .. } = &genesis_config_info;
-
+    
+    //simulate a Solana validator and no wall-clock throtling to prevent artificial delay in execution
     let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(genesis_config);
     let mut options = BlockstoreOptions::default();
     options.enforce_ulimit_nofile=false;
