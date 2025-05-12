@@ -3,6 +3,8 @@
 #![allow(unreachable_code)]
 #![allow(clippy::arithmetic_side_effects)]
 
+#[cfg(feature = "dynamic-frames")]
+use solana_program::program_memory::sol_memcmp;
 use {
     solana_program::{
         account_info::AccountInfo,
@@ -1384,7 +1386,7 @@ fn process_instruction<'a>(
 
                 let post = accounts[ARGUMENT_INDEX].try_borrow_data().unwrap().as_ptr();
 
-                if prev == post {
+                if std::ptr::eq(prev, post) {
                     panic!("failed to clone the data");
                 }
 
@@ -1437,7 +1439,7 @@ fn process_instruction<'a>(
             msg!("TEST_STACK_HEAP_ZEROED");
             const MM_STACK_START: u64 = 0x200000000;
             const MM_HEAP_START: u64 = 0x300000000;
-            const ZEROS: [u8; 256 * 1024] = [0; 256 * 1024];
+            static ZEROS: [u8; 256 * 1024] = [0; 256 * 1024];
             const STACK_FRAME_SIZE: usize = 4096;
             const MAX_CALL_DEPTH: usize = 64;
 
@@ -1456,17 +1458,34 @@ fn process_instruction<'a>(
             heap[8..pos].fill(42);
 
             // Check that the stack is zeroed too.
-            //
+            let stack = unsafe {
+                slice::from_raw_parts_mut(
+                    MM_STACK_START as *mut u8,
+                    MAX_CALL_DEPTH * STACK_FRAME_SIZE,
+                )
+            };
+
+            #[cfg(not(feature = "dynamic-frames"))]
             // We don't know in which frame we are now, so we skip a few (10) frames at the start
             // which might have been used by the current call stack. We check that the memory for
             // the 10..MAX_CALL_DEPTH frames is zeroed. Then we write a sentinel value, and in the
             // next nested invocation check that it's been zeroed.
-            let stack =
-                unsafe { slice::from_raw_parts_mut(MM_STACK_START as *mut u8, 0x100000000) };
+            //
+            // When we don't have dynamic stack frames, the stack grows from lower addresses
+            // to higher addresses, so we compare accordingly.
             for i in 10..MAX_CALL_DEPTH {
                 let stack = &mut stack[i * STACK_FRAME_SIZE..][..STACK_FRAME_SIZE];
                 assert!(stack == &ZEROS[..STACK_FRAME_SIZE], "stack not zeroed");
                 stack.fill(42);
+            }
+
+            #[cfg(feature = "dynamic-frames")]
+            // When we have dynamic frames, the stack grows from the higher addresses, so we
+            // compare from zero until the beginning of a function frame.
+            {
+                const ZEROED_BYTES_LENGTH: usize = (MAX_CALL_DEPTH - 2) * STACK_FRAME_SIZE;
+                assert_eq!(sol_memcmp(stack, &ZEROS, ZEROED_BYTES_LENGTH), 0);
+                stack[..ZEROED_BYTES_LENGTH].fill(42);
             }
 
             // Recurse to check that the stack and heap are zeroed.
@@ -1519,6 +1538,78 @@ fn process_instruction<'a>(
                     instruction_data.to_vec(),
                 ),
                 account_info_in_account,
+            )
+            .unwrap();
+        }
+        TEST_ACCOUNT_INFO_LAMPORTS_RC => {
+            msg!("TEST_ACCOUNT_INFO_LAMPORTS_RC_IN_ACCOUNT");
+
+            let mut account0 = accounts[0].clone();
+            let account1 = accounts[1].clone();
+            let account2 = accounts[2].clone();
+
+            account0.lamports = unsafe {
+                let dst = account1.data.borrow_mut().as_mut_ptr();
+                // 32 = size_of::<RcBox>()
+                std::ptr::copy(
+                    std::mem::transmute::<Rc<RefCell<&mut u64>>, *const u8>(account0.lamports),
+                    dst,
+                    32,
+                );
+                std::mem::transmute::<*mut u8, Rc<RefCell<&mut u64>>>(dst)
+            };
+
+            let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 1];
+            instruction_data.extend_from_slice(&1u64.to_le_bytes());
+            instruction_data.push(1);
+
+            invoke(
+                &create_instruction(
+                    *program_id,
+                    &[
+                        (program_id, false, false),
+                        (accounts[1].key, true, false),
+                        (accounts[0].key, false, false),
+                    ],
+                    instruction_data.to_vec(),
+                ),
+                &[account0, account1, account2],
+            )
+            .unwrap();
+        }
+        TEST_ACCOUNT_INFO_DATA_RC => {
+            msg!("TEST_ACCOUNT_INFO_DATA_RC_IN_ACCOUNT");
+
+            let mut account0 = accounts[0].clone();
+            let account1 = accounts[1].clone();
+            let account2 = accounts[2].clone();
+
+            account0.data = unsafe {
+                let dst = account1.data.borrow_mut().as_mut_ptr();
+                // 32 = size_of::<RcBox>()
+                std::ptr::copy(
+                    std::mem::transmute::<Rc<RefCell<&mut [u8]>>, *const u8>(account0.data),
+                    dst,
+                    32,
+                );
+                std::mem::transmute::<*mut u8, Rc<RefCell<&mut [u8]>>>(dst)
+            };
+
+            let mut instruction_data = vec![TEST_WRITE_ACCOUNT, 1];
+            instruction_data.extend_from_slice(&1u64.to_le_bytes());
+            instruction_data.push(1);
+
+            invoke(
+                &create_instruction(
+                    *program_id,
+                    &[
+                        (program_id, false, false),
+                        (accounts[1].key, true, false),
+                        (accounts[0].key, false, false),
+                    ],
+                    instruction_data.to_vec(),
+                ),
+                &[account0, account1, account2],
             )
             .unwrap();
         }

@@ -34,13 +34,10 @@ use {
     },
     serde::{Deserialize, Serialize},
     solana_derivation_path::DerivationPath,
-    solana_sdk::{
-        signature::Signature,
-        signer::{
-            keypair::generate_seed_from_seed_phrase_and_passphrase, EncodableKey, EncodableKeypair,
-            SeedDerivable, Signer, SignerError,
-        },
-    },
+    solana_seed_derivable::SeedDerivable,
+    solana_seed_phrase::generate_seed_from_seed_phrase_and_passphrase,
+    solana_signature::Signature,
+    solana_signer::{EncodableKey, EncodableKeypair, Signer, SignerError},
     std::convert::TryInto,
     subtle::{Choice, ConstantTimeEq},
     zeroize::Zeroize,
@@ -247,9 +244,9 @@ impl ElGamalKeypair {
     /// Reads a JSON-encoded keypair from a `Reader` implementor
     pub fn read_json<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalKeypair").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalKeypair").into())
     }
 
     /// Reads keypair from a file
@@ -412,9 +409,9 @@ impl ElGamalPubkey {
 impl EncodableKey for ElGamalPubkey {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalPubkey").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalPubkey").into())
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
@@ -569,9 +566,9 @@ impl ElGamalSecretKey {
 impl EncodableKey for ElGamalSecretKey {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalSecretKey").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalSecretKey").into())
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
@@ -719,7 +716,7 @@ impl fmt::Display for ElGamalCiphertext {
     }
 }
 
-impl<'a, 'b> Add<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Add<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn add(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -736,7 +733,7 @@ define_add_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Sub<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Sub<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn sub(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -753,7 +750,7 @@ define_sub_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a ElGamalCiphertext {
+impl<'b> Mul<&'b Scalar> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn mul(self, scalar: &'b Scalar) -> ElGamalCiphertext {
@@ -770,7 +767,7 @@ define_mul_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b ElGamalCiphertext> for &'a Scalar {
+impl<'b> Mul<&'b ElGamalCiphertext> for &Scalar {
     type Output = ElGamalCiphertext;
 
     fn mul(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -816,7 +813,7 @@ impl DecryptHandle {
     }
 }
 
-impl<'a, 'b> Add<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Add<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn add(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -830,7 +827,7 @@ define_add_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Sub<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Sub<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn sub(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -844,7 +841,7 @@ define_sub_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
+impl<'b> Mul<&'b Scalar> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn mul(self, scalar: &'b Scalar) -> DecryptHandle {
@@ -854,7 +851,7 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
 
 define_mul_variants!(LHS = DecryptHandle, RHS = Scalar, Output = DecryptHandle);
 
-impl<'a, 'b> Mul<&'b DecryptHandle> for &'a Scalar {
+impl<'b> Mul<&'b DecryptHandle> for &Scalar {
     type Output = DecryptHandle;
 
     fn mul(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -870,7 +867,9 @@ mod tests {
         super::*,
         crate::encryption::pedersen::Pedersen,
         bip39::{Language, Mnemonic, MnemonicType, Seed},
-        solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::null_signer::NullSigner},
+        solana_keypair::Keypair,
+        solana_pubkey::Pubkey,
+        solana_signer::null_signer::NullSigner,
         std::fs::{self, File},
     };
 

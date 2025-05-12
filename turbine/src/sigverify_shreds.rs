@@ -3,9 +3,10 @@ use {
         cluster_nodes::{self, check_feature_activation, ClusterNodesCache},
         retransmit_stage::RetransmitStage,
     },
+    agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
+    itertools::{Either, Itertools},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
-    solana_feature_set as feature_set,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
@@ -22,6 +23,7 @@ use {
         pubkey::Pubkey,
         signature::{Keypair, Signer},
     },
+    solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     static_assertions::const_assert_eq,
     std::{
         collections::HashMap,
@@ -64,8 +66,8 @@ pub fn spawn_shred_sigverify(
     bank_forks: Arc<RwLock<BankForks>>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     shred_fetch_receiver: Receiver<PacketBatch>,
-    retransmit_sender: Sender<Vec</*shred:*/ Vec<u8>>>,
-    verified_sender: Sender<Vec<PacketBatch>>,
+    retransmit_sender: EvictingSender<Vec<shred::Payload>>,
+    verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     num_sigverify_threads: NonZeroUsize,
 ) -> JoinHandle<()> {
     let recycler_cache = RecyclerCache::warmed();
@@ -129,8 +131,8 @@ fn run_shred_sigverify<const K: usize>(
     recycler_cache: &RecyclerCache,
     deduper: &Deduper<K, [u8]>,
     shred_fetch_receiver: &Receiver<PacketBatch>,
-    retransmit_sender: &Sender<Vec</*shred:*/ Vec<u8>>>,
-    verified_sender: &Sender<Vec<PacketBatch>>,
+    retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
+    verified_sender: &Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     cache: &RwLock<LruCache>,
     stats: &mut ShredSigVerifyStats,
@@ -143,18 +145,31 @@ fn run_shred_sigverify<const K: usize>(
     let now = Instant::now();
     stats.num_iters += 1;
     stats.num_batches += packets.len();
-    stats.num_packets += packets.iter().map(PacketBatch::len).sum::<usize>();
+    stats.num_packets += packets.iter().map(|batch| batch.len()).sum::<usize>();
     stats.num_discards_pre += count_discards(&packets);
+    // Repair shreds include a randomly generated u32 nonce, so it does not
+    // make sense to deduplicate the entire packet payload (i.e. they are not
+    // duplicate of any other packet.data(..)).
+    // If the nonce is excluded from the deduper then false positives might
+    // prevent us from repairing a block until the deduper is reset after
+    // DEDUPER_RESET_CYCLE. A workaround is to also repair "coding" shreds to
+    // add some redundancy but that is not implemented at the moment.
+    // Because the repair nonce is already verified in shred-fetch-stage we can
+    // exclude repair shreds from the deduper, but we still need to pass the
+    // repair shred to the deduper to filter out duplicates from the turbine
+    // path once a shred is repaired.
+    // For backward compatibility we need to allow trailing bytes in the packet
+    // after the shred payload, but have to exclude them here from the deduper.
     stats.num_duplicates += thread_pool.install(|| {
         packets
             .par_iter_mut()
             .flatten()
             .filter(|packet| {
                 !packet.meta().discard()
-                    && packet
-                        .data(..)
-                        .map(|data| deduper.dedup(data))
+                    && shred::wire::get_shred(packet)
+                        .map(|shred| deduper.dedup(shred))
                         .unwrap_or(true)
+                    && !packet.meta().repair()
             })
             .map(|packet| packet.meta_mut().set_discard(true))
             .count()
@@ -229,17 +244,44 @@ fn run_shred_sigverify<const K: usize>(
             })
     });
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
-    // Exclude repair packets from retransmit.
-    let shreds: Vec<_> = packets
+    // Extract shred payload from packets, and separate out repaired shreds.
+    let (shreds, repairs): (Vec<_>, Vec<_>) = packets
         .iter()
-        .flat_map(PacketBatch::iter)
-        .filter(|packet| !packet.meta().discard() && !packet.meta().repair())
-        .filter_map(shred::layout::get_shred)
-        .map(<[u8]>::to_vec)
-        .collect();
+        .flat_map(|batch| batch.iter())
+        .filter(|packet| !packet.meta().discard())
+        .filter_map(|packet| {
+            let shred = shred::layout::get_shred(packet)?.to_vec();
+            Some((shred, packet.meta().repair()))
+        })
+        .partition_map(|(shred, repair)| {
+            if repair {
+                // No need for Arc overhead here because repaired shreds are
+                // not retranmitted.
+                Either::Right(shred::Payload::from(shred))
+            } else {
+                // Share the payload between the retransmit-stage and the
+                // window-service.
+                Either::Left(shred::Payload::from(Arc::new(shred)))
+            }
+        });
+    // Repaired shreds are not retransmitted.
     stats.num_retransmit_shreds += shreds.len();
-    retransmit_sender.send(shreds)?;
-    verified_sender.send(packets)?;
+    if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
+        match send_err {
+            crossbeam_channel::TrySendError::Full(v) => {
+                stats.num_retransmit_stage_overflow_shreds += v.len();
+            }
+            _ => unreachable!("EvictingSender holds on to both ends of the channel"),
+        }
+    }
+    // Send all shreds to window service to be inserted into blockstore.
+    let shreds = shreds
+        .into_iter()
+        .map(|shred| (shred, /*is_repaired:*/ false));
+    let repairs = repairs
+        .into_iter()
+        .map(|shred| (shred, /*is_repaired:*/ true));
+    verified_sender.send(shreds.chain(repairs).collect())?;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     Ok(())
 }
@@ -279,7 +321,12 @@ fn verify_retransmitter_signature(
     let data_plane_fanout = cluster_nodes::get_data_plane_fanout(shred.slot(), root_bank);
     let parent = match cluster_nodes.get_retransmit_parent(&leader, &shred, data_plane_fanout) {
         Ok(Some(parent)) => parent,
-        Ok(None) => return true,
+        Ok(None) => {
+            stats
+                .num_retranmitter_signature_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         Err(err) => {
             error!("get_retransmit_parent: {err:?}");
             stats
@@ -288,7 +335,14 @@ fn verify_retransmitter_signature(
             return false;
         }
     };
-    signature.verify(parent.as_ref(), merkle_root.as_ref())
+    if signature.verify(parent.as_ref(), merkle_root.as_ref()) {
+        stats
+            .num_retranmitter_signature_verified
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 fn verify_packets(
@@ -324,7 +378,7 @@ fn get_slot_leaders(
     let mut leaders = HashMap::<Slot, Option<Pubkey>>::new();
     batches
         .iter_mut()
-        .flat_map(PacketBatch::iter_mut)
+        .flat_map(|batch| batch.iter_mut())
         .filter(|packet| !packet.meta().discard())
         .filter(|packet| {
             let shred = shred::layout::get_shred(packet);
@@ -348,7 +402,7 @@ fn get_slot_leaders(
 fn count_discards(packets: &[PacketBatch]) -> usize {
     packets
         .iter()
-        .flat_map(PacketBatch::iter)
+        .flat_map(|batch| batch.iter())
         .filter(|packet| packet.meta().discard())
         .count()
 }
@@ -378,6 +432,9 @@ struct ShredSigVerifyStats {
     num_discards_pre: usize,
     num_duplicates: usize,
     num_invalid_retransmitter: AtomicUsize,
+    num_retranmitter_signature_skipped: AtomicUsize,
+    num_retranmitter_signature_verified: AtomicUsize,
+    num_retransmit_stage_overflow_shreds: usize,
     num_retransmit_shreds: usize,
     num_unknown_slot_leader: AtomicUsize,
     num_unknown_turbine_parent: AtomicUsize,
@@ -399,6 +456,9 @@ impl ShredSigVerifyStats {
             num_discards_post: 0usize,
             num_duplicates: 0usize,
             num_invalid_retransmitter: AtomicUsize::default(),
+            num_retranmitter_signature_skipped: AtomicUsize::default(),
+            num_retranmitter_signature_verified: AtomicUsize::default(),
+            num_retransmit_stage_overflow_shreds: 0usize,
             num_retransmit_shreds: 0usize,
             num_unknown_slot_leader: AtomicUsize::default(),
             num_unknown_turbine_parent: AtomicUsize::default(),
@@ -423,6 +483,23 @@ impl ShredSigVerifyStats {
             (
                 "num_invalid_retransmitter",
                 self.num_invalid_retransmitter.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_retranmitter_signature_skipped",
+                self.num_retranmitter_signature_skipped
+                    .load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_retranmitter_signature_verified",
+                self.num_retranmitter_signature_verified
+                    .load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "num_retransmit_stage_overflow_shreds",
+                self.num_retransmit_stage_overflow_shreds,
                 i64
             ),
             ("num_retransmit_shreds", self.num_retransmit_shreds, i64),

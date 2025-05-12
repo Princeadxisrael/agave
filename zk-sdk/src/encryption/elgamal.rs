@@ -20,27 +20,10 @@ use wasm_bindgen::prelude::*;
 // types and functions exported for wasm targets in all of its dependencies
 // (https://github.com/rustwasm/wasm-bindgen/issues/3759). We specifically exclude some of the
 // dependencies that will cause unnecessary bloat to the wasm binary.
-#[cfg(not(target_arch = "wasm32"))]
-use {
-    crate::encryption::discrete_log::DiscreteLog,
-    sha3::Digest,
-    solana_derivation_path::DerivationPath,
-    solana_sdk::{
-        signature::Signature,
-        signer::{
-            keypair::generate_seed_from_seed_phrase_and_passphrase, EncodableKey, EncodableKeypair,
-            SeedDerivable, Signer, SignerError,
-        },
-    },
-    std::{
-        error,
-        io::{Read, Write},
-        path::Path,
-    },
-};
 use {
     crate::{
         encryption::{
+            discrete_log::DiscreteLog,
             pedersen::{Pedersen, PedersenCommitment, PedersenOpening, G, H},
             DECRYPT_HANDLE_LEN, ELGAMAL_CIPHERTEXT_LEN, ELGAMAL_KEYPAIR_LEN, ELGAMAL_PUBKEY_LEN,
             ELGAMAL_SECRET_KEY_LEN, PEDERSEN_COMMITMENT_LEN,
@@ -60,6 +43,20 @@ use {
     std::{convert::TryInto, fmt},
     subtle::{Choice, ConstantTimeEq},
     zeroize::Zeroize,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    sha3::Digest,
+    solana_derivation_path::DerivationPath,
+    solana_seed_derivable::SeedDerivable,
+    solana_seed_phrase::generate_seed_from_seed_phrase_and_passphrase,
+    solana_signature::Signature,
+    solana_signer::{EncodableKey, EncodableKeypair, Signer, SignerError},
+    std::{
+        error,
+        io::{Read, Write},
+        path::Path,
+    },
 };
 
 /// Algorithm handle for the twisted ElGamal encryption scheme
@@ -126,7 +123,6 @@ impl ElGamal {
     ///
     /// The output of this function is of type `DiscreteLog`. To recover, the originally encrypted
     /// amount, use `DiscreteLog::decode`.
-    #[cfg(not(target_arch = "wasm32"))]
     fn decrypt(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> DiscreteLog {
         DiscreteLog::new(
             *G,
@@ -139,7 +135,6 @@ impl ElGamal {
     ///
     /// If the originally encrypted amount is not a positive 32-bit number, then the function
     /// returns `None`.
-    #[cfg(not(target_arch = "wasm32"))]
     fn decrypt_u32(secret: &ElGamalSecretKey, ciphertext: &ElGamalCiphertext) -> Option<u64> {
         let discrete_log_instance = Self::decrypt(secret, ciphertext);
         discrete_log_instance.decode_u32()
@@ -163,10 +158,12 @@ impl ElGamalKeypair {
     /// Generates the public and secret keys for ElGamal encryption.
     ///
     /// This function is randomized. It internally samples a scalar element using `OsRng`.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = newRand))]
     pub fn new_rand() -> Self {
         ElGamal::keygen()
     }
 
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = pubkeyOwned))]
     pub fn pubkey_owned(&self) -> ElGamalPubkey {
         self.public
     }
@@ -228,9 +225,9 @@ impl ElGamalKeypair {
     /// Reads a JSON-encoded keypair from a `Reader` implementor
     pub fn read_json<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalKeypair").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalKeypair").into())
     }
 
     /// Reads keypair from a file
@@ -375,13 +372,26 @@ impl ElGamalPubkey {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+impl ElGamalPubkey {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = encryptU64))]
+    pub fn encrypt_u64(&self, amount: u64) -> ElGamalCiphertext {
+        ElGamal::encrypt(self, amount)
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = encryptWithU64))]
+    pub fn encrypt_with_u64(&self, amount: u64, opening: &PedersenOpening) -> ElGamalCiphertext {
+        ElGamal::encrypt_with(amount, self, opening)
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl EncodableKey for ElGamalPubkey {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalPubkey").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalPubkey").into())
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
@@ -467,6 +477,19 @@ impl ElGamalSecretKey {
     pub fn as_bytes(&self) -> &[u8; ELGAMAL_SECRET_KEY_LEN] {
         self.0.as_bytes()
     }
+
+    /// Decrypts a ciphertext using the ElGamal secret key.
+    ///
+    /// The output of this function is of type `DiscreteLog`. To recover, the originally encrypted
+    /// message, use `DiscreteLog::decode`.
+    pub fn decrypt(&self, ciphertext: &ElGamalCiphertext) -> DiscreteLog {
+        ElGamal::decrypt(self, ciphertext)
+    }
+
+    /// Decrypts a ciphertext using the ElGamal secret key interpretting the message as type `u32`.
+    pub fn decrypt_u32(&self, ciphertext: &ElGamalCiphertext) -> Option<u64> {
+        ElGamal::decrypt_u32(self, ciphertext)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -517,28 +540,15 @@ impl ElGamalSecretKey {
 
         result.to_vec()
     }
-
-    /// Decrypts a ciphertext using the ElGamal secret key.
-    ///
-    /// The output of this function is of type `DiscreteLog`. To recover, the originally encrypted
-    /// message, use `DiscreteLog::decode`.
-    pub fn decrypt(&self, ciphertext: &ElGamalCiphertext) -> DiscreteLog {
-        ElGamal::decrypt(self, ciphertext)
-    }
-
-    /// Decrypts a ciphertext using the ElGamal secret key interpretting the message as type `u32`.
-    pub fn decrypt_u32(&self, ciphertext: &ElGamalCiphertext) -> Option<u64> {
-        ElGamal::decrypt_u32(self, ciphertext)
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl EncodableKey for ElGamalSecretKey {
     fn read<R: Read>(reader: &mut R) -> Result<Self, Box<dyn error::Error>> {
         let bytes: Vec<u8> = serde_json::from_reader(reader)?;
-        Self::try_from(bytes.as_slice()).ok().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Invalid ElGamalSecretKey").into()
-        })
+        Self::try_from(bytes.as_slice())
+            .ok()
+            .ok_or_else(|| std::io::Error::other("Invalid ElGamalSecretKey").into())
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<String, Box<dyn error::Error>> {
@@ -620,6 +630,7 @@ impl ConstantTimeEq for ElGamalSecretKey {
 }
 
 /// Ciphertext for the ElGamal encryption scheme.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElGamalCiphertext {
     pub commitment: PedersenCommitment,
@@ -666,7 +677,6 @@ impl ElGamalCiphertext {
     ///
     /// The output of this function is of type `DiscreteLog`. To recover, the originally encrypted
     /// amount, use `DiscreteLog::decode`.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn decrypt(&self, secret: &ElGamalSecretKey) -> DiscreteLog {
         ElGamal::decrypt(secret, self)
     }
@@ -676,7 +686,6 @@ impl ElGamalCiphertext {
     ///
     /// If the originally encrypted amount is not a positive 32-bit number, then the function
     /// returns `None`.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn decrypt_u32(&self, secret: &ElGamalSecretKey) -> Option<u64> {
         ElGamal::decrypt_u32(secret, self)
     }
@@ -688,7 +697,7 @@ impl fmt::Display for ElGamalCiphertext {
     }
 }
 
-impl<'a, 'b> Add<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Add<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn add(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -705,7 +714,7 @@ define_add_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Sub<&'b ElGamalCiphertext> for &'a ElGamalCiphertext {
+impl<'b> Sub<&'b ElGamalCiphertext> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn sub(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -722,7 +731,7 @@ define_sub_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a ElGamalCiphertext {
+impl<'b> Mul<&'b Scalar> for &ElGamalCiphertext {
     type Output = ElGamalCiphertext;
 
     fn mul(self, scalar: &'b Scalar) -> ElGamalCiphertext {
@@ -739,7 +748,7 @@ define_mul_variants!(
     Output = ElGamalCiphertext
 );
 
-impl<'a, 'b> Mul<&'b ElGamalCiphertext> for &'a Scalar {
+impl<'b> Mul<&'b ElGamalCiphertext> for &Scalar {
     type Output = ElGamalCiphertext;
 
     fn mul(self, ciphertext: &'b ElGamalCiphertext) -> ElGamalCiphertext {
@@ -757,6 +766,7 @@ define_mul_variants!(
 );
 
 /// Decryption handle for Pedersen commitment.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DecryptHandle(RistrettoPoint);
 impl DecryptHandle {
@@ -784,7 +794,7 @@ impl DecryptHandle {
     }
 }
 
-impl<'a, 'b> Add<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Add<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn add(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -798,7 +808,7 @@ define_add_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Sub<&'b DecryptHandle> for &'a DecryptHandle {
+impl<'b> Sub<&'b DecryptHandle> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn sub(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -812,7 +822,7 @@ define_sub_variants!(
     Output = DecryptHandle
 );
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
+impl<'b> Mul<&'b Scalar> for &DecryptHandle {
     type Output = DecryptHandle;
 
     fn mul(self, scalar: &'b Scalar) -> DecryptHandle {
@@ -822,7 +832,7 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a DecryptHandle {
 
 define_mul_variants!(LHS = DecryptHandle, RHS = Scalar, Output = DecryptHandle);
 
-impl<'a, 'b> Mul<&'b DecryptHandle> for &'a Scalar {
+impl<'b> Mul<&'b DecryptHandle> for &Scalar {
     type Output = DecryptHandle;
 
     fn mul(self, handle: &'b DecryptHandle) -> DecryptHandle {
@@ -838,7 +848,9 @@ mod tests {
         super::*,
         crate::encryption::pedersen::Pedersen,
         bip39::{Language, Mnemonic, MnemonicType, Seed},
-        solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::null_signer::NullSigner},
+        solana_keypair::Keypair,
+        solana_pubkey::Pubkey,
+        solana_signer::null_signer::NullSigner,
         std::fs::{self, File},
     };
 

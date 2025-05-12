@@ -966,11 +966,13 @@ mod tests {
         super::*,
         crate::StoredConfirmedBlock,
         prost::Message,
-        solana_sdk::{
-            hash::Hash, message::v0::LoadedAddresses, signature::Keypair, system_transaction,
-            transaction::VersionedTransaction, transaction_context::TransactionReturnData,
-        },
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::v0::LoadedAddresses,
         solana_storage_proto::convert::generated,
+        solana_system_transaction as system_transaction,
+        solana_transaction::versioned::VersionedTransaction,
+        solana_transaction_context::TransactionReturnData,
         solana_transaction_status::{
             ConfirmedBlock, TransactionStatusMeta, TransactionWithStatusMeta,
             VersionedTransactionWithStatusMeta,
@@ -1006,7 +1008,7 @@ mod tests {
     #[test]
     fn test_deserialize_protobuf_or_bincode_cell_data() {
         let from = Keypair::new();
-        let recipient = solana_sdk::pubkey::new_rand();
+        let recipient = solana_pubkey::new_rand();
         let transaction = system_transaction::transfer(&from, &recipient, 42, Hash::default());
         let with_meta = TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
             transaction: VersionedTransaction::from(transaction),
@@ -1023,6 +1025,7 @@ mod tests {
                 loaded_addresses: LoadedAddresses::default(),
                 return_data: Some(TransactionReturnData::default()),
                 compute_units_consumed: Some(1234),
+                cost_units: Some(5678),
             },
         });
         let expected_block = ConfirmedBlock {
@@ -1083,6 +1086,7 @@ mod tests {
                 meta.rewards = None; // Legacy bincode implementation does not support rewards
                 meta.return_data = None; // Legacy bincode implementation does not support return data
                 meta.compute_units_consumed = None; // Legacy bincode implementation does not support CU consumed
+                meta.cost_units = None; // Legacy bincode implementation does not support CU
             }
             assert_eq!(block, bincode_block.into());
         } else {

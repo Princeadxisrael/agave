@@ -3,7 +3,7 @@
 use crate::{rpc_pubsub_service, rpc_subscriptions::RpcSubscriptions};
 use {
     crate::{
-        rpc::check_is_at_least_confirmed,
+        rpc::{check_is_at_least_confirmed, optimize_filters, verify_filters},
         rpc_pubsub_service::PubSubConfig,
         rpc_subscription_tracker::{
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
@@ -450,9 +450,18 @@ impl RpcSolPubSubInternal for RpcSolPubSubImpl {
         config: Option<RpcProgramAccountsConfig>,
     ) -> Result<SubscriptionId> {
         let config = config.unwrap_or_default();
+        let mut filters = config.filters.unwrap_or_default();
+        if let Err(error) = verify_filters(&filters) {
+            return Err(Error {
+                code: ErrorCode::InvalidParams,
+                message: error.to_string(),
+                data: None,
+            });
+        }
+        optimize_filters(&mut filters);
         let params = ProgramSubscriptionParams {
             pubkey: param::<Pubkey>(&pubkey_str, "pubkey")?,
-            filters: config.filters.unwrap_or_default(),
+            filters,
             encoding: config
                 .account_config
                 .encoding
@@ -610,7 +619,7 @@ mod tests {
         base64::{prelude::BASE64_STANDARD, Engine},
         jsonrpc_core::{IoHandler, Response},
         serial_test::serial,
-        solana_account_decoder::{parse_account_data::parse_account_data_v2, UiAccountEncoding},
+        solana_account_decoder::{parse_account_data::parse_account_data_v3, UiAccountEncoding},
         solana_rpc_client_api::response::{
             ProcessedSignatureResult, ReceivedSignatureResult, RpcSignatureResult, SlotInfo,
         },
@@ -810,7 +819,7 @@ mod tests {
             mint_keypair: alice,
             ..
         } = create_genesis_config(10_000);
-        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let bob_pubkey = solana_pubkey::new_rand();
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
         let bank_forks = BankForks::new_rw_arc(bank);
@@ -864,7 +873,7 @@ mod tests {
         genesis_config.rent = Rent::default();
         activate_all_features(&mut genesis_config);
 
-        let new_stake_authority = solana_sdk::pubkey::new_rand();
+        let new_stake_authority = solana_pubkey::new_rand();
         let stake_authority = Keypair::new();
         let from = Keypair::new();
         let stake_account = Keypair::new();
@@ -1049,7 +1058,7 @@ mod tests {
             .get_account(&nonce_account.pubkey())
             .unwrap();
         let expected_data = account.data();
-        let expected_data = parse_account_data_v2(
+        let expected_data = parse_account_data_v3(
             &nonce_account.pubkey(),
             &system_program::id(),
             expected_data,
@@ -1085,7 +1094,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_account_unsubscribe() {
-        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let bob_pubkey = solana_pubkey::new_rand();
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));

@@ -4,12 +4,10 @@ use {
         check_balance,
         cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
     },
+    solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        signature::{keypair_from_seed, Keypair, Signer},
-    },
+    solana_sdk::signature::{keypair_from_seed, Keypair, Signer},
     solana_streamer::socket::SocketAddrSpace,
     solana_test_validator::TestValidator,
     test_case::test_case,
@@ -23,11 +21,8 @@ fn test_publish(compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator = TestValidator::with_no_base_fees(
-        mint_pubkey,
-        Some(faucet_addr),
-        SocketAddrSpace::Unspecified,
-    );
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());

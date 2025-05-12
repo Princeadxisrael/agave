@@ -1,9 +1,8 @@
-#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
-mod compute_budget_instruction_details;
-mod compute_budget_program_id_filter;
-pub mod instructions_processor;
+mod instruction_data_len;
+pub(crate) mod instruction_meta;
 pub mod runtime_transaction;
 pub mod signature_details;
 pub mod transaction_meta;
+pub mod transaction_with_meta;

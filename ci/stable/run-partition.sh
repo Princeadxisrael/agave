@@ -27,13 +27,13 @@ fi
 
 ARGS=(
   --profile ci
-  --config-file ./nextest.toml
   --workspace
   --tests
   --jobs "$JOBS"
   --partition hash:"$((INDEX + 1))/$LIMIT"
   --verbose
   --exclude solana-local-cluster
+  --no-tests=warn
 )
 
 _ cargo nextest run "${ARGS[@]}"

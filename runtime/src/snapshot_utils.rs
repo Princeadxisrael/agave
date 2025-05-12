@@ -1,6 +1,6 @@
 use {
     crate::{
-        bank::{BankFieldsToSerialize, BankSlotDelta},
+        bank::{BankFieldsToSerialize, BankHashStats, BankSlotDelta},
         serde_snapshot::{
             self, BankIncrementalSnapshotPersistence, ExtraFieldsToSerialize, SnapshotStreams,
         },
@@ -23,10 +23,11 @@ use {
     log::*,
     regex::Regex,
     solana_accounts_db::{
-        account_storage::{meta::StoredMetaWriteVersion, AccountStorageMap},
-        accounts_db::{stats::BankHashStats, AccountStorageEntry, AtomicAccountsFileId},
+        account_storage::AccountStorageMap,
+        accounts_db::{AccountStorageEntry, AtomicAccountsFileId},
         accounts_file::{AccountsFile, AccountsFileError, InternalsForArchive, StorageAccess},
         accounts_hash::{AccountsDeltaHash, AccountsHash},
+        append_vec::StoredMetaWriteVersion,
         epoch_accounts_hash::EpochAccountsHash,
         hardened_unpack::{self, ParallelSelector, UnpackError},
         shared_buffer_reader::{SharedBuffer, SharedBufferReader},
@@ -81,9 +82,9 @@ pub const BANK_SNAPSHOT_PRE_FILENAME_EXTENSION: &str = "pre";
 // - Necessary in order to have a plain NonZeroUsize as the constant, NonZeroUsize
 //   returns an Option<NonZeroUsize> and we can't .unwrap() at compile time
 pub const DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN: NonZeroUsize =
-    unsafe { NonZeroUsize::new_unchecked(2) };
+    NonZeroUsize::new(2).unwrap();
 pub const DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN: NonZeroUsize =
-    unsafe { NonZeroUsize::new_unchecked(4) };
+    NonZeroUsize::new(4).unwrap();
 pub const FULL_SNAPSHOT_ARCHIVE_FILENAME_REGEX: &str = r"^snapshot-(?P<slot>[[:digit:]]+)-(?P<hash>[[:alnum:]]+)\.(?P<ext>tar|tar\.bz2|tar\.zst|tar\.gz|tar\.lz4)$";
 pub const INCREMENTAL_SNAPSHOT_ARCHIVE_FILENAME_REGEX: &str = r"^incremental-snapshot-(?P<base>[[:digit:]]+)-(?P<slot>[[:digit:]]+)-(?P<hash>[[:alnum:]]+)\.(?P<ext>tar|tar\.bz2|tar\.zst|tar\.gz|tar\.lz4)$";
 
@@ -114,7 +115,7 @@ impl FromStr for SnapshotVersion {
         // Remove leading 'v' or 'V' from slice
         let version_string = if version_string
             .get(..1)
-            .map_or(false, |s| s.eq_ignore_ascii_case("v"))
+            .is_some_and(|s| s.eq_ignore_ascii_case("v"))
         {
             &version_string[1..]
         } else {
@@ -339,8 +340,11 @@ pub enum SnapshotError {
     #[error("no snapshot archives to load from '{0}'")]
     NoSnapshotArchives(PathBuf),
 
-    #[error("snapshot has mismatch: deserialized bank: {0:?}, snapshot archive info: {1:?}")]
-    MismatchedSlotHash((Slot, SnapshotHash), (Slot, SnapshotHash)),
+    #[error("snapshot slot mismatch: deserialized bank: {0}, snapshot archive: {1}")]
+    MismatchedSlot(Slot, Slot),
+
+    #[error("snapshot hash mismatch: deserialized bank: {0:?}, snapshot archive: {1:?}")]
+    MismatchedHash(SnapshotHash, SnapshotHash),
 
     #[error("snapshot slot deltas are invalid: {0}")]
     VerifySlotDeltas(#[from] VerifySlotDeltasError),
@@ -458,8 +462,8 @@ pub enum AddBankSnapshotError {
     #[error("failed to write snapshot version file '{1}': {0}")]
     WriteSnapshotVersionFile(#[source] IoError, PathBuf),
 
-    #[error("failed to mark snapshot as 'complete': failed to create file '{1}': {0}")]
-    CreateStateCompleteFile(#[source] IoError, PathBuf),
+    #[error("failed to mark snapshot as 'complete': {0}")]
+    MarkSnapshotComplete(#[source] IoError),
 }
 
 /// Errors that can happen in `archive_snapshot_package()`
@@ -638,6 +642,20 @@ fn is_bank_snapshot_complete(bank_snapshot_dir: impl AsRef<Path>) -> bool {
         .as_ref()
         .join(SNAPSHOT_STATE_COMPLETE_FILENAME);
     state_complete_path.is_file()
+}
+
+/// Marks the bank snapshot as complete
+fn write_snapshot_state_complete_file(bank_snapshot_dir: impl AsRef<Path>) -> IoResult<()> {
+    let state_complete_path = bank_snapshot_dir
+        .as_ref()
+        .join(SNAPSHOT_STATE_COMPLETE_FILENAME);
+    fs::File::create(&state_complete_path).map_err(|err| {
+        IoError::other(format!(
+            "failed to create file '{}': {err}",
+            state_complete_path.display(),
+        ))
+    })?;
+    Ok(())
 }
 
 /// Writes the full snapshot slot file into the bank snapshot dir
@@ -884,6 +902,7 @@ fn serialize_snapshot(
                 incremental_snapshot_persistence: bank_incremental_snapshot_persistence,
                 epoch_accounts_hash,
                 versioned_epoch_stakes,
+                accounts_lt_hash: bank_fields.accounts_lt_hash.clone().map(Into::into),
             };
             serde_snapshot::serialize_bank_snapshot_into(
                 stream,
@@ -917,11 +936,10 @@ fn serialize_snapshot(
         .map_err(|err| AddBankSnapshotError::WriteSnapshotVersionFile(err, version_path))?);
 
         // Mark this directory complete so it can be used.  Check this flag first before selecting for deserialization.
-        let state_complete_path = bank_snapshot_dir.join(SNAPSHOT_STATE_COMPLETE_FILENAME);
-        let (_, write_state_complete_file_us) = measure_us!(fs::File::create(&state_complete_path)
-            .map_err(|err| {
-                AddBankSnapshotError::CreateStateCompleteFile(err, state_complete_path)
-            })?);
+        let (_, write_state_complete_file_us) = measure_us!({
+            write_snapshot_state_complete_file(&bank_snapshot_dir)
+                .map_err(AddBankSnapshotError::MarkSnapshotComplete)?
+        });
 
         measure_everything.stop();
 
@@ -1036,6 +1054,15 @@ fn archive_snapshot(
 
         let do_archive_files = |encoder: &mut dyn Write| -> std::result::Result<(), E> {
             let mut archive = tar::Builder::new(encoder);
+            // Disable sparse file handling.  This seems to be the root cause of an issue when
+            // upgrading v2.0 to v2.1, and the tar crate from 0.4.41 to 0.4.42.
+            // Since the tarball will still go through compression (zstd/etc) afterwards, disabling
+            // sparse handling in the tar itself should be fine.
+            //
+            // Likely introduced in [^1].  Tracking resolution in [^2].
+            // [^1] https://github.com/alexcrichton/tar-rs/pull/375
+            // [^2] https://github.com/alexcrichton/tar-rs/issues/403
+            archive.sparse(false);
             // Serialize the version and snapshots files before accounts so we can quickly determine the version
             // and other bank fields. This is necessary if we want to interleave unpacking with reconstruction
             archive
@@ -1082,10 +1109,10 @@ fn archive_snapshot(
                 do_archive_files(&mut encoder)?;
                 encoder.finish().map_err(E::FinishEncoder)?;
             }
-            ArchiveFormat::TarZstd => {
-                // Compression level of 1 is optimized for speed.
+            ArchiveFormat::TarZstd { config } => {
                 let mut encoder =
-                    zstd::stream::Encoder::new(archive_file, 1).map_err(E::CreateEncoder)?;
+                    zstd::stream::Encoder::new(archive_file, config.compression_level)
+                        .map_err(E::CreateEncoder)?;
                 do_archive_files(&mut encoder)?;
                 encoder.finish().map_err(E::FinishEncoder)?;
             }
@@ -1658,8 +1685,7 @@ fn create_snapshot_meta_files_for_unarchived_snapshot(unpack_dir: impl AsRef<Pat
         slot_dir.join(SNAPSHOT_STATUS_CACHE_FILENAME),
     )?;
 
-    let state_complete_file = slot_dir.join(SNAPSHOT_STATE_COMPLETE_FILENAME);
-    fs::File::create(state_complete_file)?;
+    write_snapshot_state_complete_file(slot_dir)?;
 
     Ok(())
 }
@@ -2266,7 +2292,7 @@ fn untar_snapshot_create_shared_buffer(
     match archive_format {
         ArchiveFormat::TarBzip2 => SharedBuffer::new(BzDecoder::new(BufReader::new(open_file()))),
         ArchiveFormat::TarGzip => SharedBuffer::new(GzDecoder::new(BufReader::new(open_file()))),
-        ArchiveFormat::TarZstd => SharedBuffer::new(
+        ArchiveFormat::TarZstd { .. } => SharedBuffer::new(
             zstd::stream::read::Decoder::new(BufReader::new(open_file())).unwrap(),
         ),
         ArchiveFormat::TarLz4 => {
@@ -2734,7 +2760,13 @@ mod tests {
                 Hash::default()
             ))
             .unwrap(),
-            (43, SnapshotHash(Hash::default()), ArchiveFormat::TarZstd)
+            (
+                43,
+                SnapshotHash(Hash::default()),
+                ArchiveFormat::TarZstd {
+                    config: ZstdConfig::default(),
+                }
+            )
         );
         assert_eq!(
             parse_full_snapshot_archive_filename(&format!("snapshot-44-{}.tar", Hash::default()))
@@ -2815,7 +2847,9 @@ mod tests {
                 43,
                 234,
                 SnapshotHash(Hash::default()),
-                ArchiveFormat::TarZstd
+                ArchiveFormat::TarZstd {
+                    config: ZstdConfig::default(),
+                }
             )
         );
         assert_eq!(
@@ -2940,8 +2974,7 @@ mod tests {
             fs::write(version_path, SnapshotVersion::default().as_str().as_bytes()).unwrap();
 
             // Mark this directory complete so it can be used.  Check this flag first before selecting for deserialization.
-            let state_complete_path = snapshot_dir.join(SNAPSHOT_STATE_COMPLETE_FILENAME);
-            fs::File::create(state_complete_path).unwrap();
+            write_snapshot_state_complete_file(snapshot_dir).unwrap();
         }
     }
 

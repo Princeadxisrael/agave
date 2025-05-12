@@ -6,12 +6,12 @@ use {
         spend_utils::SpendAmount,
     },
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
+    solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::blockhash_query::{self, BlockhashQuery},
     solana_sdk::{
         account_utils::StateMut,
-        commitment_config::CommitmentConfig,
         signature::{Keypair, NullSigner, Signer},
     },
     solana_streamer::socket::SocketAddrSpace,
@@ -26,11 +26,8 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator = TestValidator::with_no_base_fees(
-        mint_pubkey,
-        Some(faucet_addr),
-        SocketAddrSpace::Unspecified,
-    );
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
@@ -40,14 +37,8 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
-    let priority_fee = 200_000 * compute_unit_price.unwrap_or(0);
-    request_and_confirm_airdrop(
-        &rpc_client,
-        &config,
-        &config.signers[0].pubkey(),
-        100_000 + priority_fee,
-    )
-    .unwrap();
+    request_and_confirm_airdrop(&rpc_client, &config, &config.signers[0].pubkey(), 100_000)
+        .unwrap();
 
     // Create vote account
     let vote_account_keypair = Keypair::new();
@@ -179,7 +170,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, withdraw_authority.pubkey());
 
     // Withdraw from vote account
-    let destination_account = solana_sdk::pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
+    let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
     config.signers = vec![&default_signer, &withdraw_authority];
     config.command = CliCommand::WithdrawFromVoteAccount {
         vote_account_pubkey,
@@ -219,7 +210,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     process_command(&config).unwrap();
 
     // Close vote account
-    let destination_account = solana_sdk::pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
+    let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
     config.signers = vec![&default_signer, &withdraw_authority];
     config.command = CliCommand::CloseVoteAccount {
         vote_account_pubkey,
@@ -240,11 +231,8 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator = TestValidator::with_no_base_fees(
-        mint_pubkey,
-        Some(faucet_addr),
-        SocketAddrSpace::Unspecified,
-    );
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
@@ -262,32 +250,23 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     // Verify that we cannot reach the cluster
     process_command(&config_offline).unwrap_err();
 
-    let airdrop_amount = 100_000_000;
     request_and_confirm_airdrop(
         &rpc_client,
         &config_payer,
         &config_payer.signers[0].pubkey(),
-        airdrop_amount,
+        100_000,
     )
     .unwrap();
-    check_balance!(
-        airdrop_amount,
-        &rpc_client,
-        &config_payer.signers[0].pubkey()
-    );
+    check_balance!(100_000, &rpc_client, &config_payer.signers[0].pubkey());
 
     request_and_confirm_airdrop(
         &rpc_client,
         &config_offline,
         &config_offline.signers[0].pubkey(),
-        airdrop_amount,
+        100_000,
     )
     .unwrap();
-    check_balance!(
-        airdrop_amount,
-        &rpc_client,
-        &config_offline.signers[0].pubkey()
-    );
+    check_balance!(100_000, &rpc_client, &config_offline.signers[0].pubkey());
 
     // Create vote account with specific withdrawer
     let vote_account_keypair = Keypair::new();
@@ -395,7 +374,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, withdraw_authority.pubkey());
 
     // Withdraw from vote account offline
-    let destination_account = solana_sdk::pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
+    let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
     let blockhash = rpc_client.get_latest_blockhash().unwrap();
     let fee_payer_null_signer = NullSigner::new(&default_signer.pubkey());
     config_offline.signers = vec![&fee_payer_null_signer, &withdraw_authority];
@@ -486,7 +465,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
 
     // Close vote account offline. Must use WithdrawFromVoteAccount and specify amount, since
     // CloseVoteAccount requires RpcClient
-    let destination_account = solana_sdk::pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
+    let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
     config_offline.signers = vec![&fee_payer_null_signer, &withdraw_authority];
     config_offline.command = CliCommand::WithdrawFromVoteAccount {
         vote_account_pubkey,

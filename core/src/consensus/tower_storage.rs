@@ -31,7 +31,7 @@ impl SavedTowerVersions {
                 if !t.signature.verify(node_pubkey.as_ref(), &t.data) {
                     return Err(TowerError::InvalidSignature);
                 }
-                bincode::deserialize(&t.data).map(TowerVersions::V1_17_14)
+                bincode::deserialize(&t.data).map(TowerVersions::V1_7_14)
             }
             SavedTowerVersions::Current(t) => {
                 if !t.signature.verify(node_pubkey.as_ref(), &t.data) {
@@ -79,11 +79,12 @@ impl From<SavedTower1_7_14> for SavedTowerVersions {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "JBXfVQ6BXHBGSNY919yEkXN4H7XxmAMA7QcGrf7DiWHP")
+    frozen_abi(digest = "GqJW8vVvSkSZwTJE6x6MFFhi7kcU6mqst8PF7493h2hk")
 )]
 #[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct SavedTower {
     signature: Signature,
+    #[serde(with = "serde_bytes")]
     data: Vec<u8>,
     #[serde(skip)]
     node_pubkey: Pubkey,
@@ -122,8 +123,7 @@ pub struct NullTowerStorage {}
 
 impl TowerStorage for NullTowerStorage {
     fn load(&self, _node_pubkey: &Pubkey) -> Result<Tower> {
-        Err(TowerError::IoError(io::Error::new(
-            io::ErrorKind::Other,
+        Err(TowerError::IoError(io::Error::other(
             "NullTowerStorage::load() not available",
         )))
     }
@@ -277,7 +277,7 @@ impl EtcdTowerStorage {
     }
 
     fn etdc_to_tower_error(error: etcd_client::Error) -> TowerError {
-        TowerError::IoError(io::Error::new(io::ErrorKind::Other, error.to_string()))
+        TowerError::IoError(io::Error::other(error.to_string()))
     }
 }
 
@@ -314,10 +314,9 @@ impl TowerStorage for EtcdTowerStorage {
             })?;
 
         if !response.succeeded() {
-            return Err(TowerError::IoError(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Lost etcd instance lock for {node_pubkey}"),
-            )));
+            return Err(TowerError::IoError(io::Error::other(format!(
+                "Lost etcd instance lock for {node_pubkey}"
+            ))));
         }
 
         for op_response in response.op_responses() {
@@ -331,8 +330,7 @@ impl TowerStorage for EtcdTowerStorage {
         }
 
         // Should never happen...
-        Err(TowerError::IoError(io::Error::new(
-            io::ErrorKind::Other,
+        Err(TowerError::IoError(io::Error::other(
             "Saved tower response missing".to_string(),
         )))
     }
@@ -362,10 +360,10 @@ impl TowerStorage for EtcdTowerStorage {
             .map_err(Self::etdc_to_tower_error)?;
 
         if !response.succeeded() {
-            return Err(TowerError::IoError(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Lost etcd instance lock for {}", saved_tower.pubkey()),
-            )));
+            return Err(TowerError::IoError(io::Error::other(format!(
+                "Lost etcd instance lock for {}",
+                saved_tower.pubkey()
+            ))));
         }
         Ok(())
     }
@@ -380,9 +378,9 @@ pub mod test {
             BlockhashStatus, Tower,
         },
         solana_sdk::{hash::Hash, signature::Keypair},
+        solana_vote::vote_transaction::VoteTransaction,
         solana_vote_program::vote_state::{
-            BlockTimestamp, LandedVote, Vote, VoteState, VoteState1_14_11, VoteTransaction,
-            MAX_LOCKOUT_HISTORY,
+            BlockTimestamp, LandedVote, Vote, VoteState, VoteState1_14_11, MAX_LOCKOUT_HISTORY,
         },
         tempfile::TempDir,
     };

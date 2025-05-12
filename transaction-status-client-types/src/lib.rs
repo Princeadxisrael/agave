@@ -6,20 +6,17 @@ use {
     serde_derive::{Deserialize, Serialize},
     serde_json::Value,
     solana_account_decoder_client_types::token::UiTokenAmount,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        instruction::CompiledInstruction,
-        message::{
-            v0::{LoadedAddresses, MessageAddressTableLookup},
-            MessageHeader,
-        },
-        reward_type::RewardType,
-        transaction::{
-            Result as TransactionResult, TransactionError, TransactionVersion, VersionedTransaction,
-        },
-        transaction_context::TransactionReturnData,
+    solana_commitment_config::CommitmentConfig,
+    solana_message::{
+        compiled_instruction::CompiledInstruction,
+        v0::{LoadedAddresses, MessageAddressTableLookup},
+        MessageHeader,
     },
+    solana_reward_info::RewardType,
     solana_signature::Signature,
+    solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::{TransactionError, TransactionResult},
     thiserror::Error,
 };
 pub mod option_serializer;
@@ -278,6 +275,11 @@ pub struct UiTransactionStatusMeta {
         skip_serializing_if = "OptionSerializer::should_skip"
     )]
     pub compute_units_consumed: OptionSerializer<u64>,
+    #[serde(
+        default = "OptionSerializer::skip",
+        skip_serializing_if = "OptionSerializer::should_skip"
+    )]
+    pub cost_units: OptionSerializer<u64>,
 }
 
 impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
@@ -307,6 +309,7 @@ impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
                 meta.return_data.map(|return_data| return_data.into()),
             ),
             compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
+            cost_units: OptionSerializer::or_skip(meta.cost_units),
         }
     }
 }
@@ -550,6 +553,7 @@ pub struct TransactionStatusMeta {
     pub loaded_addresses: LoadedAddresses,
     pub return_data: Option<TransactionReturnData>,
     pub compute_units_consumed: Option<u64>,
+    pub cost_units: Option<u64>,
 }
 
 impl Default for TransactionStatusMeta {
@@ -567,6 +571,7 @@ impl Default for TransactionStatusMeta {
             loaded_addresses: LoadedAddresses::default(),
             return_data: None,
             compute_units_consumed: None,
+            cost_units: None,
         }
     }
 }

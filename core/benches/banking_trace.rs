@@ -2,6 +2,7 @@
 
 // extern crate test;
 
+<<<<<<< HEAD
 // use {
 //     solana_core::banking_trace::{
 //         for_test::{
@@ -18,6 +19,25 @@
 //     tempfile::TempDir,
 //     test::Bencher,
 // };
+=======
+use {
+    agave_banking_stage_ingress_types::BankingPacketBatch,
+    solana_core::banking_trace::{
+        for_test::{
+            drop_and_clean_temp_dir_unless_suppressed, sample_packet_batch, terminate_tracer,
+        },
+        receiving_loop_with_minimized_sender_overhead, BankingTracer, Channels, TraceError,
+        TracerThreadResult, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+    },
+    std::{
+        path::PathBuf,
+        sync::{atomic::AtomicBool, Arc},
+        thread,
+    },
+    tempfile::TempDir,
+    test::Bencher,
+};
+>>>>>>> upstream/master
 
 // fn ensure_fresh_setup_to_benchmark(path: &PathBuf) {
 //     // make sure fresh setup; otherwise banking tracer appends and rotates
@@ -31,11 +51,23 @@
 //     Ok(())
 // }
 
+<<<<<<< HEAD
 // #[bench]
 // fn bench_banking_tracer_main_thread_overhead_noop_baseline(bencher: &mut Bencher) {
 //     let exit = Arc::<AtomicBool>::default();
 //     let tracer = BankingTracer::new_disabled();
 //     let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
+=======
+#[bench]
+fn bench_banking_tracer_main_thread_overhead_noop_baseline(bencher: &mut Bencher) {
+    let exit = Arc::<AtomicBool>::default();
+    let tracer = BankingTracer::new_disabled();
+    let Channels {
+        non_vote_sender,
+        non_vote_receiver,
+        ..
+    } = tracer.create_channels(false);
+>>>>>>> upstream/master
 
 //     let exit_for_dummy_thread = exit.clone();
 //     let dummy_main_thread = thread::spawn(move || {
@@ -57,6 +89,7 @@
 // fn bench_banking_tracer_main_thread_overhead_under_peak_write(bencher: &mut Bencher) {
 //     let temp_dir = TempDir::new().unwrap();
 
+<<<<<<< HEAD
 //     let exit = Arc::<AtomicBool>::default();
 //     let (tracer, tracer_thread) = BankingTracer::new(Some((
 //         &temp_dir.path().join("banking-trace"),
@@ -65,6 +98,20 @@
 //     )))
 //     .unwrap();
 //     let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
+=======
+    let exit = Arc::<AtomicBool>::default();
+    let (tracer, tracer_thread) = BankingTracer::new(Some((
+        &temp_dir.path().join("banking-trace"),
+        exit.clone(),
+        BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+    )))
+    .unwrap();
+    let Channels {
+        non_vote_sender,
+        non_vote_receiver,
+        ..
+    } = tracer.create_channels(false);
+>>>>>>> upstream/master
 
 //     let exit_for_dummy_thread = exit.clone();
 //     let dummy_main_thread = thread::spawn(move || {
@@ -94,6 +141,7 @@
 // fn bench_banking_tracer_main_thread_overhead_under_sustained_write(bencher: &mut Bencher) {
 //     let temp_dir = TempDir::new().unwrap();
 
+<<<<<<< HEAD
 //     let exit = Arc::<AtomicBool>::default();
 //     let (tracer, tracer_thread) = BankingTracer::new(Some((
 //         &temp_dir.path().join("banking-trace"),
@@ -102,6 +150,20 @@
 //     )))
 //     .unwrap();
 //     let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
+=======
+    let exit = Arc::<AtomicBool>::default();
+    let (tracer, tracer_thread) = BankingTracer::new(Some((
+        &temp_dir.path().join("banking-trace"),
+        exit.clone(),
+        1024 * 1024, // cause more frequent trace file rotation
+    )))
+    .unwrap();
+    let Channels {
+        non_vote_sender,
+        non_vote_receiver,
+        ..
+    } = tracer.create_channels(false);
+>>>>>>> upstream/master
 
 //     let exit_for_dummy_thread = exit.clone();
 //     let dummy_main_thread = thread::spawn(move || {
@@ -140,9 +202,19 @@
 
 //         let exit = Arc::<AtomicBool>::default();
 
+<<<<<<< HEAD
 //         let (tracer, tracer_thread) =
 //             BankingTracer::new(Some((&path, exit.clone(), 50 * 1024 * 1024))).unwrap();
 //         let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
+=======
+        let (tracer, tracer_thread) =
+            BankingTracer::new(Some((&path, exit.clone(), 50 * 1024 * 1024))).unwrap();
+        let Channels {
+            non_vote_sender,
+            non_vote_receiver,
+            ..
+        } = tracer.create_channels(false);
+>>>>>>> upstream/master
 
 //         let dummy_main_thread = thread::spawn(move || {
 //             receiving_loop_with_minimized_sender_overhead::<_, TraceError, 0>(

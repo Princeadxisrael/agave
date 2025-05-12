@@ -1,21 +1,18 @@
 use {
-    crate::transaction_processing_callback::TransactionProcessingCallback,
+    solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount},
+    solana_clock::Slot,
+    solana_instruction::error::InstructionError,
+    solana_loader_v3_interface::state::UpgradeableLoaderState,
+    solana_loader_v4_interface::state::{LoaderV4State, LoaderV4Status},
     solana_program_runtime::loaded_programs::{
         LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
         ProgramRuntimeEnvironment, ProgramRuntimeEnvironments, DELAY_VISIBILITY_SLOT_OFFSET,
     },
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        account_utils::StateMut,
-        bpf_loader, bpf_loader_deprecated,
-        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        clock::Slot,
-        instruction::InstructionError,
-        loader_v4::{self, LoaderV4State, LoaderV4Status},
-        pubkey::Pubkey,
-        transaction::{self, TransactionError},
-    },
-    solana_timings::ExecuteDetailsTimings,
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4},
+    solana_svm_callback::TransactionProcessingCallback,
+    solana_timings::ExecuteTimings,
+    solana_transaction_error::{TransactionError, TransactionResult},
     solana_type_overrides::sync::Arc,
 };
 
@@ -124,6 +121,7 @@ pub fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
     environments: &ProgramRuntimeEnvironments,
     pubkey: &Pubkey,
     slot: Slot,
+    execute_timings: &mut ExecuteTimings,
     reload: bool,
 ) -> Option<Arc<ProgramCacheEntry>> {
     let mut load_program_metrics = LoadProgramMetrics {
@@ -191,18 +189,14 @@ pub fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
                     &loader_v4::id(),
                     program_account.data().len(),
                     slot,
-                    environments.program_runtime_v2.clone(),
+                    environments.program_runtime_v1.clone(),
                     reload,
                 )
             })
             .map_err(|_| (slot, ProgramCacheEntryOwner::LoaderV4)),
     }
     .unwrap_or_else(|(slot, owner)| {
-        let env = if let ProgramCacheEntryOwner::LoaderV4 = &owner {
-            environments.program_runtime_v2.clone()
-        } else {
-            environments.program_runtime_v1.clone()
-        };
+        let env = environments.program_runtime_v1.clone();
         ProgramCacheEntry::new_tombstone(
             slot,
             owner,
@@ -210,8 +204,7 @@ pub fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
         )
     });
 
-    let mut timings = ExecuteDetailsTimings::default();
-    load_program_metrics.submit_datapoint(&mut timings);
+    load_program_metrics.submit_datapoint(&mut execute_timings.details);
     loaded_program.update_access_slot(slot);
     Some(Arc::new(loaded_program))
 }
@@ -223,7 +216,7 @@ pub fn load_program_with_pubkey<CB: TransactionProcessingCallback>(
 pub(crate) fn get_program_modification_slot<CB: TransactionProcessingCallback>(
     callbacks: &CB,
     pubkey: &Pubkey,
-) -> transaction::Result<Slot> {
+) -> TransactionResult<Slot> {
     let program = callbacks
         .get_account_shared_data(pubkey)
         .ok_or(TransactionError::ProgramAccountNotFound)?;
@@ -258,11 +251,13 @@ mod tests {
     use {
         super::*,
         crate::transaction_processor::TransactionBatchProcessor,
+        solana_account::WritableAccount,
         solana_program_runtime::{
             loaded_programs::{BlockRelation, ForkGraph, ProgramRuntimeEnvironments},
-            solana_rbpf::program::BuiltinProgram,
+            solana_sbpf::program::BuiltinProgram,
         },
-        solana_sdk::{account::WritableAccount, bpf_loader, bpf_loader_upgradeable},
+        solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable},
+        solana_svm_callback::InvokeContextCallback,
         std::{
             cell::RefCell,
             collections::HashMap,
@@ -281,9 +276,11 @@ mod tests {
     }
 
     #[derive(Default, Clone)]
-    pub struct MockBankCallback {
-        pub account_shared_data: RefCell<HashMap<Pubkey, AccountSharedData>>,
+    pub(crate) struct MockBankCallback {
+        pub(crate) account_shared_data: RefCell<HashMap<Pubkey, AccountSharedData>>,
     }
+
+    impl InvokeContextCallback for MockBankCallback {}
 
     impl TransactionProcessingCallback for MockBankCallback {
         fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
@@ -528,6 +525,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(50).unwrap(),
             &key,
             500,
+            &mut ExecuteTimings::default(),
             false,
         );
         assert!(result.is_none());
@@ -550,6 +548,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(20).unwrap(),
             &key,
             0, // Slot 0
+            &mut ExecuteTimings::default(),
             false,
         );
 
@@ -584,6 +583,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(20).unwrap(),
             &key,
             200,
+            &mut ExecuteTimings::default(),
             false,
         );
         let loaded_program = ProgramCacheEntry::new_tombstone(
@@ -611,6 +611,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(20).unwrap(),
             &key,
             200,
+            &mut ExecuteTimings::default(),
             false,
         );
 
@@ -664,6 +665,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(0).unwrap(),
             &key1,
             0,
+            &mut ExecuteTimings::default(),
             false,
         );
         let loaded_program = ProgramCacheEntry::new_tombstone(
@@ -701,6 +703,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(20).unwrap(),
             &key1,
             200,
+            &mut ExecuteTimings::default(),
             false,
         );
 
@@ -750,6 +753,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(0).unwrap(),
             &key,
             0,
+            &mut ExecuteTimings::default(),
             false,
         );
         let loaded_program = ProgramCacheEntry::new_tombstone(
@@ -783,6 +787,7 @@ mod tests {
             &batch_processor.get_environments_for_epoch(20).unwrap(),
             &key,
             200,
+            &mut ExecuteTimings::default(),
             false,
         );
 
@@ -833,6 +838,7 @@ mod tests {
                     .unwrap(),
                 &key,
                 200,
+                &mut ExecuteTimings::default(),
                 false,
             )
             .unwrap();

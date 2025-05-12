@@ -2,12 +2,11 @@ use {
     crossbeam_channel::Receiver as CrossbeamReceiver,
     futures::future::BoxFuture,
     solana_cli_config::ConfigInput,
+    solana_commitment_config::CommitmentConfig,
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        pubkey::Pubkey,
-        signer::{keypair::Keypair, Signer},
-    },
+    solana_signer::Signer,
     solana_streamer::{
         nonblocking::testing_utilities::{
             make_client_endpoint, setup_quic_server, SpawnTestServerResult, TestServerConfig,
@@ -16,16 +15,16 @@ use {
         streamer::StakedNodes,
     },
     solana_tpu_client_next::{
-        connection_workers_scheduler::ConnectionWorkersSchedulerConfig,
-        leader_updater::create_leader_updater, transaction_batch::TransactionBatch,
-        ConnectionWorkersScheduler, ConnectionWorkersSchedulerError, SendTransactionStats,
-        SendTransactionStatsPerAddr,
+        connection_workers_scheduler::{BindTarget, ConnectionWorkersSchedulerConfig, Fanout},
+        leader_updater::create_leader_updater,
+        send_transaction_stats::SendTransactionStatsNonAtomic,
+        transaction_batch::TransactionBatch,
+        ConnectionWorkersScheduler, ConnectionWorkersSchedulerError,
     },
     std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::Saturating,
-        str::FromStr,
         sync::{atomic::Ordering, Arc},
         time::Duration,
     },
@@ -40,24 +39,33 @@ use {
     tokio_util::sync::CancellationToken,
 };
 
-fn test_config(validator_identity: Option<Keypair>) -> ConnectionWorkersSchedulerConfig {
+fn test_config(stake_identity: Option<Keypair>) -> ConnectionWorkersSchedulerConfig {
+    let address = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 0);
     ConnectionWorkersSchedulerConfig {
-        bind: SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 0),
-        stake_identity: validator_identity,
+        bind: BindTarget::Address(address),
+        stake_identity: stake_identity.map(Into::into),
         num_connections: 1,
         skip_check_transaction_age: false,
-        worker_channel_size: 2,
+        // At the moment we have only one strategy to send transactions: we try
+        // to put to worker channel transaction batch and in case of failure
+        // just drop it. This requires to use large channels here. In the
+        // future, we are planning to add an option to send with backpressure at
+        // the speed of fastest leader.
+        worker_channel_size: 100,
         max_reconnect_attempts: 4,
-        lookahead_slots: 1,
+        leaders_fanout: Fanout {
+            send: 1,
+            connect: 1,
+        },
     }
 }
 
 async fn setup_connection_worker_scheduler(
     tpu_address: SocketAddr,
     transaction_receiver: Receiver<TransactionBatch>,
-    validator_identity: Option<Keypair>,
+    stake_identity: Option<Keypair>,
 ) -> (
-    JoinHandle<Result<SendTransactionStatsPerAddr, ConnectionWorkersSchedulerError>>,
+    JoinHandle<Result<ConnectionWorkersScheduler, ConnectionWorkersSchedulerError>>,
     CancellationToken,
 ) {
     let json_rpc_url = "http://127.0.0.1:8899";
@@ -74,30 +82,23 @@ async fn setup_connection_worker_scheduler(
         .expect("Leader updates was successfully created");
 
     let cancel = CancellationToken::new();
-    let config = test_config(validator_identity);
-    let scheduler = tokio::spawn(ConnectionWorkersScheduler::run(
-        config,
-        leader_updater,
-        transaction_receiver,
-        cancel.clone(),
-    ));
+    let config = test_config(stake_identity);
+    let scheduler = ConnectionWorkersScheduler::new(leader_updater, transaction_receiver);
+    let scheduler = tokio::spawn(scheduler.run(config, cancel.clone()));
 
     (scheduler, cancel)
 }
 
 async fn join_scheduler(
     scheduler_handle: JoinHandle<
-        Result<SendTransactionStatsPerAddr, ConnectionWorkersSchedulerError>,
+        Result<ConnectionWorkersScheduler, ConnectionWorkersSchedulerError>,
     >,
-) -> SendTransactionStats {
-    let stats_per_ip = scheduler_handle
+) -> SendTransactionStatsNonAtomic {
+    let scheduler = scheduler_handle
         .await
         .unwrap()
         .expect("Scheduler should stop successfully.");
-    stats_per_ip
-        .get(&IpAddr::from_str("127.0.0.1").unwrap())
-        .expect("setup_connection_worker_scheduler() connected to a leader at 127.0.0.1")
-        .clone()
+    scheduler.get_stats().read_and_reset()
 }
 
 // Specify the pessimistic time to finish generation and result checks.
@@ -236,14 +237,8 @@ async fn test_basic_transactions_sending() {
 
     // Stop sending
     tx_sender_shutdown.await;
-    let localhost_stats = join_scheduler(scheduler_handle).await;
-    assert_eq!(
-        localhost_stats,
-        SendTransactionStats {
-            successfully_sent: expected_num_txs as u64,
-            ..Default::default()
-        }
-    );
+    let stats = join_scheduler(scheduler_handle).await;
+    assert_eq!(stats.successfully_sent, expected_num_txs as u64,);
 
     // Stop server
     exit.store(true, Ordering::Relaxed);
@@ -313,14 +308,13 @@ async fn test_connection_denied_until_allowed() {
 
     // Wait for the exchange to finish.
     tx_sender_shutdown.await;
-    let localhost_stats = join_scheduler(scheduler_handle).await;
+    let stats = join_scheduler(scheduler_handle).await;
     // in case of pruning, server closes the connection with code 1 and error
     // message b"dropped". This might lead to connection error
     // (ApplicationClosed::ApplicationClose) or to stream error
     // (ConnectionLost::ApplicationClosed::ApplicationClose).
     assert_eq!(
-        localhost_stats.write_error_connection_lost
-            + localhost_stats.connection_error_application_closed,
+        stats.write_error_connection_lost + stats.connection_error_application_closed,
         1
     );
 
@@ -372,14 +366,13 @@ async fn test_connection_pruned_and_reopened() {
 
     // Wait for the exchange to finish.
     tx_sender_shutdown.await;
-    let localhost_stats = join_scheduler(scheduler_handle).await;
+    let stats = join_scheduler(scheduler_handle).await;
     // in case of pruning, server closes the connection with code 1 and error
     // message b"dropped". This might lead to connection error
     // (ApplicationClosed::ApplicationClose) or to stream error
     // (ConnectionLost::ApplicationClosed::ApplicationClose).
     assert_eq!(
-        localhost_stats.connection_error_application_closed
-            + localhost_stats.write_error_connection_lost,
+        stats.connection_error_application_closed + stats.write_error_connection_lost,
         1,
     );
 
@@ -392,8 +385,8 @@ async fn test_connection_pruned_and_reopened() {
 /// connection and verify that all the txs has been received.
 #[tokio::test]
 async fn test_staked_connection() {
-    let validator_identity = Keypair::new();
-    let stakes = HashMap::from([(validator_identity.pubkey(), 100_000)]);
+    let stake_identity = Keypair::new();
+    let stakes = HashMap::from([(stake_identity.pubkey(), 100_000)]);
     let staked_nodes = StakedNodes::new(Arc::new(stakes), HashMap::<Pubkey, u64>::default());
 
     let SpawnTestServerResult {
@@ -424,8 +417,7 @@ async fn test_staked_connection() {
     } = spawn_tx_sender(tx_size, expected_num_txs, Duration::from_millis(100));
 
     let (scheduler_handle, _scheduler_cancel) =
-        setup_connection_worker_scheduler(server_address, tx_receiver, Some(validator_identity))
-            .await;
+        setup_connection_worker_scheduler(server_address, tx_receiver, Some(stake_identity)).await;
 
     // Check results
     let actual_num_packets = count_received_packets_for(receiver, tx_size, TEST_MAX_TIME).await;
@@ -433,10 +425,10 @@ async fn test_staked_connection() {
 
     // Wait for the exchange to finish.
     tx_sender_shutdown.await;
-    let localhost_stats = join_scheduler(scheduler_handle).await;
+    let stats = join_scheduler(scheduler_handle).await;
     assert_eq!(
-        localhost_stats,
-        SendTransactionStats {
+        stats,
+        SendTransactionStatsNonAtomic {
             successfully_sent: expected_num_txs as u64,
             ..Default::default()
         }
@@ -480,10 +472,10 @@ async fn test_connection_throttling() {
 
     // Stop sending
     tx_sender_shutdown.await;
-    let localhost_stats = join_scheduler(scheduler_handle).await;
+    let stats = join_scheduler(scheduler_handle).await;
     assert_eq!(
-        localhost_stats,
-        SendTransactionStats {
+        stats,
+        SendTransactionStatsNonAtomic {
             successfully_sent: expected_num_txs as u64,
             ..Default::default()
         }
@@ -524,13 +516,10 @@ async fn test_no_host() {
     tx_sender_shutdown.await;
 
     // While attempting to establish a connection with a nonexistent host, we fill the worker's
-    // channel. Transactions from this channel will never be sent and will eventually be dropped
-    // without increasing the `SendTransactionStats` counters.
-    let stats = scheduler_handle
-        .await
-        .expect("Scheduler should stop successfully")
-        .expect("Scheduler execution was successful");
-    assert_eq!(stats, HashMap::new());
+    // channel.
+    let stats = join_scheduler(scheduler_handle).await;
+    // `5` because `config.max_reconnect_attempts` is 4
+    assert_eq!(stats.connect_error_invalid_remote_address, 5);
 }
 
 // Check that when the client is rate-limited by server, we update counters
@@ -552,7 +541,7 @@ async fn test_rate_limiting() {
         None,
         TestServerConfig {
             max_connections_per_peer: 100,
-            max_connections_per_ipaddr_per_minute: 1,
+            max_connections_per_ipaddr_per_min: 1,
             ..Default::default()
         },
     );
@@ -580,13 +569,13 @@ async fn test_rate_limiting() {
 
     // And the scheduler.
     scheduler_cancel.cancel();
-    let localhost_stats = join_scheduler(scheduler_handle).await;
+    let stats = join_scheduler(scheduler_handle).await;
 
     // We do not expect to see any errors, as the connection is in the pending state still, when we
     // do the shutdown.  If we increase the time we wait in `count_received_packets_for`, we would
     // start seeing a `connection_error_timed_out` incremented to 1.  Potentially, we may want to
     // accept both 0 and 1 as valid values for it.
-    assert_eq!(localhost_stats, SendTransactionStats::default());
+    assert_eq!(stats, SendTransactionStatsNonAtomic::default());
 
     // Stop the server.
     exit.store(true, Ordering::Relaxed);
@@ -610,7 +599,7 @@ async fn test_rate_limiting_establish_connection() {
         None,
         TestServerConfig {
             max_connections_per_peer: 100,
-            max_connections_per_ipaddr_per_minute: 1,
+            max_connections_per_ipaddr_per_min: 1,
             ..Default::default()
         },
     );
@@ -644,26 +633,26 @@ async fn test_rate_limiting_establish_connection() {
 
     // And the scheduler.
     scheduler_cancel.cancel();
-    let mut localhost_stats = join_scheduler(scheduler_handle).await;
+    let mut stats = join_scheduler(scheduler_handle).await;
     assert!(
-        localhost_stats.connection_error_timed_out > 0,
+        stats.connection_error_timed_out > 0,
         "As the quinn timeout is below 1 minute, a few connections will fail to connect during \
          the 1 minute delay.\n\
          Actual connection_error_timed_out: {}",
-        localhost_stats.connection_error_timed_out
+        stats.connection_error_timed_out
     );
     assert!(
-        localhost_stats.successfully_sent > 0,
+        stats.successfully_sent > 0,
         "As we run the test for longer than 1 minute, we expect a connection to be established, \
          and a number of transactions to be delivered.\n\
          Actual successfully_sent: {}",
-        localhost_stats.successfully_sent
+        stats.successfully_sent
     );
 
     // All the rest of the error counters should be 0.
-    localhost_stats.connection_error_timed_out = 0;
-    localhost_stats.successfully_sent = 0;
-    assert_eq!(localhost_stats, SendTransactionStats::default());
+    stats.connection_error_timed_out = 0;
+    stats.successfully_sent = 0;
+    assert_eq!(stats, SendTransactionStatsNonAtomic::default());
 
     // Stop the server.
     exit.store(true, Ordering::Relaxed);

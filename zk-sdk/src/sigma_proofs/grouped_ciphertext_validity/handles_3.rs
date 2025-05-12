@@ -8,6 +8,8 @@
 //! The protocol guarantees computational soundness (by the hardness of discrete log) and perfect
 //! zero-knowledge in the random oracle model.
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 #[cfg(not(target_os = "solana"))]
 use {
     crate::{
@@ -41,6 +43,7 @@ const GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_PROOF_LEN: usize = UNIT_LEN * 6;
 /// The grouped ciphertext validity proof for 3 handles.
 ///
 /// Contains all the elliptic curve and scalar components that make up the sigma protocol.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[allow(non_snake_case)]
 #[derive(Clone)]
 pub struct GroupedCiphertext3HandlesValidityProof {
@@ -157,6 +160,9 @@ impl GroupedCiphertext3HandlesValidityProof {
         transcript.append_point(b"Y_3", &self.Y_3);
 
         let c = transcript.challenge_scalar(b"c");
+
+        transcript.append_scalar(b"z_r", &self.z_r);
+        transcript.append_scalar(b"z_x", &self.z_x);
         let w = transcript.challenge_scalar(b"w");
         let ww = &w * &w;
         let www = &w * &ww;

@@ -1,6 +1,7 @@
 // #![allow(clippy::arithmetic_side_effects)]
 // // #![feature(test)]
 
+<<<<<<< HEAD
 // use {
 //     crossbeam_channel::{unbounded, Receiver},
 //     rayon::{
@@ -35,6 +36,43 @@
 //     tempfile::TempDir,
 //     test::Bencher,
 // };
+=======
+use {
+    crossbeam_channel::{unbounded, Receiver},
+    rayon::{
+        iter::IndexedParallelIterator,
+        prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    },
+    solana_core::banking_stage::{
+        committer::Committer, consumer::Consumer, qos_service::QosService,
+    },
+    solana_entry::entry::Entry,
+    solana_ledger::{
+        blockstore::Blockstore,
+        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+    },
+    solana_poh::{
+        poh_recorder::create_test_recorder, poh_service::PohService,
+        transaction_recorder::TransactionRecorder,
+    },
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_sdk::{
+        account::{Account, ReadableAccount},
+        signature::Keypair,
+        signer::Signer,
+        stake_history::Epoch,
+        system_program, system_transaction,
+        transaction::SanitizedTransaction,
+    },
+    std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    tempfile::TempDir,
+    test::Bencher,
+};
+>>>>>>> upstream/master
 
 // extern crate test;
 
@@ -66,6 +104,7 @@
 //     accounts
 // }
 
+<<<<<<< HEAD
 // fn create_transactions(bank: &Bank, num: usize) -> Vec<SanitizedTransaction> {
 //     let funded_accounts = create_funded_accounts(bank, 2 * num);
 //     funded_accounts
@@ -96,6 +135,37 @@
 //     poh_service: PohService,
 //     signal_receiver: Receiver<(Arc<Bank>, (Entry, u64))>,
 // }
+=======
+fn create_transactions(bank: &Bank, num: usize) -> Vec<RuntimeTransaction<SanitizedTransaction>> {
+    let funded_accounts = create_funded_accounts(bank, 2 * num);
+    funded_accounts
+        .into_par_iter()
+        .chunks(2)
+        .map(|chunk| {
+            let from = &chunk[0];
+            let to = &chunk[1];
+            system_transaction::transfer(from, &to.pubkey(), 1, bank.last_blockhash())
+        })
+        .map(RuntimeTransaction::from_transaction_for_tests)
+        .collect()
+}
+
+fn create_consumer(transaction_recorder: TransactionRecorder) -> Consumer {
+    let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+    let committer = Committer::new(None, replay_vote_sender, Arc::default());
+    Consumer::new(committer, transaction_recorder, QosService::new(0), None)
+}
+
+struct BenchFrame {
+    bank: Arc<Bank>,
+    _bank_forks: Arc<RwLock<BankForks>>,
+    ledger_path: TempDir,
+    exit: Arc<AtomicBool>,
+    transaction_recorder: TransactionRecorder,
+    poh_service: PohService,
+    signal_receiver: Receiver<(Arc<Bank>, (Entry, u64))>,
+}
+>>>>>>> upstream/master
 
 // fn setup() -> BenchFrame {
 //     let mint_total = u64::MAX;
@@ -118,6 +188,7 @@
 //         .set_limits(u64::MAX, u64::MAX, u64::MAX);
 //     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
+<<<<<<< HEAD
 //     let ledger_path = TempDir::new().unwrap();
 //     let blockstore = Arc::new(
 //         Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger"),
@@ -135,6 +206,25 @@
 //         signal_receiver,
 //     }
 // }
+=======
+    let ledger_path = TempDir::new().unwrap();
+    let blockstore = Arc::new(
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger"),
+    );
+    let (exit, _poh_recorder, transaction_recorder, poh_service, signal_receiver) =
+        create_test_recorder(bank.clone(), blockstore, None, None);
+
+    BenchFrame {
+        bank,
+        _bank_forks: bank_forks,
+        ledger_path,
+        exit,
+        transaction_recorder,
+        poh_service,
+        signal_receiver,
+    }
+}
+>>>>>>> upstream/master
 
 // fn bench_process_and_record_transactions(bencher: &mut Bencher, batch_size: usize) {
 //     const TRANSACTIONS_PER_ITERATION: usize = 64;
@@ -146,6 +236,7 @@
 //     );
 //     let batches_per_iteration = TRANSACTIONS_PER_ITERATION / batch_size;
 
+<<<<<<< HEAD
 //     let BenchFrame {
 //         bank,
 //         _bank_forks,
@@ -172,6 +263,31 @@
 //                 .is_ok());
 //         }
 //     });
+=======
+    let BenchFrame {
+        bank,
+        _bank_forks,
+        ledger_path: _ledger_path,
+        exit,
+        transaction_recorder,
+        poh_service,
+        signal_receiver: _signal_receiver,
+    } = setup();
+    let consumer = create_consumer(transaction_recorder);
+    let transactions = create_transactions(&bank, 2_usize.pow(20));
+    let mut transaction_iter = transactions.chunks(batch_size);
+
+    bencher.iter(move || {
+        for _ in 0..batches_per_iteration {
+            let summary =
+                consumer.process_and_record_transactions(&bank, transaction_iter.next().unwrap());
+            assert!(summary
+                .execute_and_commit_transactions_output
+                .commit_transactions_result
+                .is_ok());
+        }
+    });
+>>>>>>> upstream/master
 
 //     exit.store(true, Ordering::Relaxed);
 //     poh_service.join().unwrap();

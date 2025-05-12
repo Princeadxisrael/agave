@@ -38,6 +38,7 @@ pub(super) struct BroadcastDuplicatesRun {
     config: BroadcastDuplicatesConfig,
     current_slot: Slot,
     chained_merkle_root: Hash,
+    carryover_entry: Option<WorkingBankEntry>,
     next_shred_index: u32,
     next_code_index: u32,
     shred_version: u16,
@@ -59,6 +60,7 @@ impl BroadcastDuplicatesRun {
         Self {
             config,
             chained_merkle_root: Hash::default(),
+            carryover_entry: None,
             next_shred_index: u32::MAX,
             next_code_index: 0,
             shred_version,
@@ -84,7 +86,9 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
         // 1) Pull entries from banking stage
-        let mut receive_results = broadcast_utils::recv_slot_entries(receiver)?;
+        let mut stats = ProcessShredsStats::default();
+        let mut receive_results =
+            broadcast_utils::recv_slot_entries(receiver, &mut self.carryover_entry, &mut stats)?;
         let bank = receive_results.bank.clone();
         let last_tick_height = receive_results.last_tick_height;
 
@@ -186,7 +190,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
             self.next_code_index,
             true, // merkle_variant
             &self.reed_solomon_cache,
-            &mut ProcessShredsStats::default(),
+            &mut stats,
         );
         if let Some(shred) = data_shreds.iter().max_by_key(|shred| shred.index()) {
             self.chained_merkle_root = shred.merkle_root().unwrap();
@@ -206,7 +210,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
                     self.next_code_index,
                     true, // merkle_variant
                     &self.reed_solomon_cache,
-                    &mut ProcessShredsStats::default(),
+                    &mut stats,
                 );
                 // Don't mark the last shred as last so that validators won't
                 // know that they've gotten all the shreds, and will continue
@@ -220,7 +224,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
                     self.next_code_index,
                     true, // merkle_variant
                     &self.reed_solomon_cache,
-                    &mut ProcessShredsStats::default(),
+                    &mut stats,
                 );
                 let sigs: Vec<_> = partition_last_data_shred
                     .iter()
@@ -341,7 +345,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
             .iter()
             .filter_map(|shred| {
                 let node = cluster_nodes.get_broadcast_peer(&shred.id())?;
-                if !socket_addr_space.check(&node.tvu(Protocol::UDP).ok()?) {
+                if !socket_addr_space.check(&node.tvu(Protocol::UDP)?) {
                     return None;
                 }
                 if self
@@ -380,26 +384,19 @@ impl BroadcastRun for BroadcastDuplicatesRun {
                                     pubkey,
                                 );
                                 let tvu = cluster_info
-                                    .lookup_contact_info(pubkey, |node| node.tvu(Protocol::UDP))?
-                                    .ok()?;
+                                    .lookup_contact_info(pubkey, |node| node.tvu(Protocol::UDP))??;
                                 Some((shred.payload(), tvu))
                             })
                             .collect(),
                     );
                 }
 
-                Some(vec![(shred.payload(), node.tvu(Protocol::UDP).ok()?)])
+                Some(vec![(shred.payload(), node.tvu(Protocol::UDP)?)])
             })
             .flatten()
             .collect();
 
-        match batch_send(sock, &packets) {
-            Ok(()) => (),
-            Err(SendPktsError::IoError(ioerr, _)) => {
-                return Err(Error::Io(ioerr));
-            }
-        }
-        Ok(())
+        batch_send(sock, packets).map_err(|SendPktsError::IoError(err, _)| Error::Io(err))
     }
 
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {

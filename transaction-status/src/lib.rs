@@ -2,7 +2,7 @@
 
 pub use {
     crate::extract_memos::extract_and_fmt_memos,
-    solana_sdk::reward_type::RewardType,
+    solana_reward_info::RewardType,
     solana_transaction_status_client_types::{
         option_serializer, ConfirmedTransactionStatusWithSignature, EncodeError,
         EncodedConfirmedBlock, EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
@@ -22,20 +22,22 @@ use {
         parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
         parse_instruction::parse,
     },
+    agave_reserved_account_keys::ReservedAccountKeys,
     base64::{prelude::BASE64_STANDARD, Engine},
-    solana_sdk::{
-        clock::{Slot, UnixTimestamp},
-        hash::Hash,
-        instruction::CompiledInstruction,
-        message::{
-            v0::{self, LoadedAddresses, LoadedMessage},
-            AccountKeys, Message, VersionedMessage,
-        },
-        pubkey::Pubkey,
-        reserved_account_keys::ReservedAccountKeys,
-        signature::Signature,
-        transaction::{Transaction, TransactionError, TransactionVersion, VersionedTransaction},
+    solana_clock::{Slot, UnixTimestamp},
+    solana_hash::Hash,
+    solana_message::{
+        compiled_instruction::CompiledInstruction,
+        v0::{self, LoadedAddresses, LoadedMessage},
+        AccountKeys, Message, VersionedMessage,
     },
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction::{
+        versioned::{TransactionVersion, VersionedTransaction},
+        Transaction,
+    },
+    solana_transaction_error::TransactionError,
     std::collections::HashSet,
     thiserror::Error,
 };
@@ -120,7 +122,7 @@ pub fn parse_ui_instruction(
 /// Maps a list of inner instructions from `solana_sdk` into a list of this
 /// crate's representation of inner instructions (with instruction indices).
 pub fn map_inner_instructions(
-    inner_instructions: solana_sdk::inner_instruction::InnerInstructionsList,
+    inner_instructions: solana_message::inner_instruction::InnerInstructionsList,
 ) -> impl Iterator<Item = InnerInstructions> {
     inner_instructions
         .into_iter()
@@ -185,6 +187,7 @@ fn build_simple_ui_transaction_status_meta(
         loaded_addresses: OptionSerializer::Skip,
         return_data: OptionSerializer::Skip,
         compute_units_consumed: OptionSerializer::Skip,
+        cost_units: OptionSerializer::Skip,
     }
 }
 
@@ -223,6 +226,7 @@ fn parse_ui_transaction_status_meta(
             meta.return_data.map(|return_data| return_data.into()),
         ),
         compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
+        cost_units: OptionSerializer::or_skip(meta.cost_units),
     }
 }
 
@@ -874,6 +878,7 @@ mod test {
             },
             return_data: None,
             compute_units_consumed: None,
+            cost_units: None,
         };
         let expected_json_output_value: serde_json::Value = serde_json::from_str(
             "{\

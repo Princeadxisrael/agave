@@ -17,8 +17,8 @@ LIMIT=${2:-"$BUILDKITE_PARALLEL_JOB_COUNT"}
 
 _ cargo nextest run \
   --profile ci \
-  --config-file ./nextest.toml \
   --package solana-local-cluster \
   --test local_cluster \
   --partition hash:"$((INDEX + 1))/$LIMIT" \
-  --test-threads=1
+  --test-threads=1 \
+  --no-tests=warn

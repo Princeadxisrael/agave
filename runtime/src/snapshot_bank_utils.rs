@@ -1,6 +1,6 @@
 use {
     crate::{
-        bank::{builtins::BuiltinPrototype, Bank, BankFieldsToDeserialize, BankSlotDelta},
+        bank::{Bank, BankFieldsToDeserialize, BankSlotDelta},
         epoch_stakes::EpochStakes,
         runtime_config::RuntimeConfig,
         serde_snapshot::{
@@ -23,6 +23,7 @@ use {
         },
         status_cache,
     },
+    agave_feature_set as feature_set,
     bincode::{config::Options, serialize_into},
     log::*,
     solana_accounts_db::{
@@ -31,9 +32,11 @@ use {
             CalcAccountsHashDataSource, DuplicatesLtHash,
         },
         accounts_file::StorageAccess,
+        accounts_hash::MerkleOrLatticeAccountsHash,
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         utils::delete_contents_of_path,
     },
+    solana_builtins::prototype::BuiltinPrototype,
     solana_measure::{measure::Measure, measure_time},
     solana_sdk::{
         clock::{Epoch, Slot},
@@ -50,7 +53,7 @@ use {
     tempfile::TempDir,
 };
 
-pub const DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS: Slot = 25_000;
+pub const DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS: Slot = 50_000;
 pub const DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS: Slot = 100;
 pub const DISABLED_SNAPSHOT_ARCHIVE_INTERVAL: Slot = Slot::MAX;
 
@@ -211,17 +214,21 @@ pub fn bank_from_snapshot_archives(
         snapshot_archive_info.hash,
     )?;
 
-    let base = incremental_snapshot_archive_info.is_some().then(|| {
-        let base_slot = full_snapshot_archive_info.slot();
-        let base_capitalization = bank
-            .rc
-            .accounts
-            .accounts_db
-            .get_accounts_hash(base_slot)
-            .expect("accounts hash must exist at full snapshot's slot")
-            .1;
-        (base_slot, base_capitalization)
-    });
+    let base = if bank.is_snapshots_lt_hash_enabled() {
+        None
+    } else {
+        incremental_snapshot_archive_info.is_some().then(|| {
+            let base_slot = full_snapshot_archive_info.slot();
+            let base_capitalization = bank
+                .rc
+                .accounts
+                .accounts_db
+                .get_accounts_hash(base_slot)
+                .expect("accounts hash must exist at full snapshot's slot")
+                .1;
+            (base_slot, base_capitalization)
+        })
+    };
 
     let mut measure_verify = Measure::start("verify");
     if !bank.verify_snapshot_bank(
@@ -446,24 +453,51 @@ pub fn bank_from_latest_snapshot_dir(
     Ok(bank)
 }
 
-/// Check to make sure the deserialized bank's slot and hash matches the snapshot archive's slot
-/// and hash
+/// Verifies the snapshot's slot and hash matches the bank's
 fn verify_bank_against_expected_slot_hash(
     bank: &Bank,
-    expected_slot: Slot,
-    expected_hash: SnapshotHash,
+    snapshot_slot: Slot,
+    snapshot_hash: SnapshotHash,
 ) -> snapshot_utils::Result<()> {
     let bank_slot = bank.slot();
-    let bank_hash = bank.get_snapshot_hash();
-
-    if bank_slot != expected_slot || bank_hash != expected_hash {
-        return Err(SnapshotError::MismatchedSlotHash(
-            (bank_slot, bank_hash),
-            (expected_slot, expected_hash),
-        ));
+    if bank_slot != snapshot_slot {
+        return Err(SnapshotError::MismatchedSlot(bank_slot, snapshot_slot));
     }
 
-    Ok(())
+    let bank_hash = bank.get_snapshot_hash();
+    if bank_hash == snapshot_hash {
+        return Ok(());
+    }
+
+    // If the slots match but the hashes don't, there may be a mismatch between snapshot
+    // generation and snapshot load w.r.t. the snapshots_lt_hash cli args.
+
+    if bank
+        .feature_set
+        .is_active(&feature_set::snapshots_lt_hash::id())
+    {
+        // ...but, if the snapshots_lt_hash *feature* is active, then mismatches are errors
+        return Err(SnapshotError::MismatchedHash(bank_hash, snapshot_hash));
+    }
+
+    // once here, we know the snapshots_lt_hash *feature* is *disabled*, so check the other kind of
+    // snapshot hash in case we match that one
+    let other_bank_hash = if bank.is_snapshots_lt_hash_enabled() {
+        // If our snapshots_lt_hash cli arg is ON, maybe the node that generated this snapshot had
+        // the cli arg OFF?  Try getting the merkle-based snapshot hash to compare.
+        bank.get_merkle_snapshot_hash()
+    } else {
+        // If our snapshots_lt_hash cli arg is OFF, maybe the node that generated this snapshot had
+        // the cli arg ON?  Try getting the lattice-based snapshot hash to compare.
+        bank.get_lattice_snapshot_hash()
+    };
+
+    if other_bank_hash == snapshot_hash {
+        Ok(())
+    } else {
+        // yes, use the *original* bank_hash here, not other_bank_hash
+        Err(SnapshotError::MismatchedHash(bank_hash, snapshot_hash))
+    }
 }
 
 fn bank_fields_from_snapshots(
@@ -908,8 +942,18 @@ fn bank_to_full_snapshot_archive_with(
     bank.rehash(); // Bank may have been manually modified by the caller
     bank.force_flush_accounts_cache();
     bank.clean_accounts();
-    let calculated_accounts_hash =
-        bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, false, false);
+
+    let merkle_or_lattice_accounts_hash = if bank.is_snapshots_lt_hash_enabled() {
+        MerkleOrLatticeAccountsHash::Lattice
+    } else {
+        let calculated_accounts_hash =
+            bank.update_accounts_hash(CalcAccountsHashDataSource::Storages, false);
+        let accounts_hash = bank
+            .get_accounts_hash()
+            .expect("accounts hash is required for snapshot");
+        assert_eq!(accounts_hash, calculated_accounts_hash);
+        MerkleOrLatticeAccountsHash::Merkle(accounts_hash.into())
+    };
 
     let snapshot_storages = bank.get_snapshot_storages(None);
     let status_cache_slot_deltas = bank.status_cache.read().unwrap().root_slot_deltas();
@@ -920,12 +964,8 @@ fn bank_to_full_snapshot_archive_with(
         status_cache_slot_deltas,
         None,
     );
-
-    let accounts_hash = bank
-        .get_accounts_hash()
-        .expect("accounts hash is required for snapshot");
-    assert_eq!(accounts_hash, calculated_accounts_hash);
-    let snapshot_package = SnapshotPackage::new(accounts_package, accounts_hash.into(), None);
+    let snapshot_package =
+        SnapshotPackage::new(accounts_package, merkle_or_lattice_accounts_hash, None);
 
     let snapshot_config = SnapshotConfig {
         full_snapshot_archives_dir: full_snapshot_archives_dir.as_ref().to_path_buf(),
@@ -971,8 +1011,41 @@ pub fn bank_to_incremental_snapshot_archive(
     bank.rehash(); // Bank may have been manually modified by the caller
     bank.force_flush_accounts_cache();
     bank.clean_accounts();
-    let calculated_incremental_accounts_hash =
-        bank.update_incremental_accounts_hash(full_snapshot_slot);
+
+    let (merkle_or_lattice_accounts_hash, bank_incremental_snapshot_persistence) =
+        if bank.is_snapshots_lt_hash_enabled() {
+            (MerkleOrLatticeAccountsHash::Lattice, None)
+        } else {
+            let calculated_incremental_accounts_hash =
+                bank.update_incremental_accounts_hash(full_snapshot_slot);
+            let (full_accounts_hash, full_capitalization) = bank
+                .rc
+                .accounts
+                .accounts_db
+                .get_accounts_hash(full_snapshot_slot)
+                .expect("base accounts hash is required for incremental snapshot");
+            let (incremental_accounts_hash, incremental_capitalization) = bank
+                .rc
+                .accounts
+                .accounts_db
+                .get_incremental_accounts_hash(bank.slot())
+                .expect("incremental accounts hash is required for incremental snapshot");
+            assert_eq!(
+                incremental_accounts_hash,
+                calculated_incremental_accounts_hash,
+            );
+            let bank_incremental_snapshot_persistence = BankIncrementalSnapshotPersistence {
+                full_slot: full_snapshot_slot,
+                full_hash: full_accounts_hash.into(),
+                full_capitalization,
+                incremental_hash: incremental_accounts_hash.into(),
+                incremental_capitalization,
+            };
+            (
+                MerkleOrLatticeAccountsHash::Merkle(incremental_accounts_hash.into()),
+                Some(bank_incremental_snapshot_persistence),
+            )
+        };
 
     let snapshot_storages = bank.get_snapshot_storages(Some(full_snapshot_slot));
     let status_cache_slot_deltas = bank.status_cache.read().unwrap().root_slot_deltas();
@@ -983,34 +1056,10 @@ pub fn bank_to_incremental_snapshot_archive(
         status_cache_slot_deltas,
         None,
     );
-
-    let (full_accounts_hash, full_capitalization) = bank
-        .rc
-        .accounts
-        .accounts_db
-        .get_accounts_hash(full_snapshot_slot)
-        .expect("base accounts hash is required for incremental snapshot");
-    let (incremental_accounts_hash, incremental_capitalization) = bank
-        .rc
-        .accounts
-        .accounts_db
-        .get_incremental_accounts_hash(bank.slot())
-        .expect("incremental accounts hash is required for incremental snapshot");
-    assert_eq!(
-        incremental_accounts_hash,
-        calculated_incremental_accounts_hash,
-    );
-    let bank_incremental_snapshot_persistence = BankIncrementalSnapshotPersistence {
-        full_slot: full_snapshot_slot,
-        full_hash: full_accounts_hash.into(),
-        full_capitalization,
-        incremental_hash: incremental_accounts_hash.into(),
-        incremental_capitalization,
-    };
     let snapshot_package = SnapshotPackage::new(
         accounts_package,
-        incremental_accounts_hash.into(),
-        Some(bank_incremental_snapshot_persistence),
+        merkle_or_lattice_accounts_hash,
+        bank_incremental_snapshot_persistence,
     );
 
     // Note: Since the snapshot_storages above are *only* the incremental storages,
@@ -1057,6 +1106,7 @@ mod tests {
             },
             status_cache::Status,
         },
+        agave_feature_set as feature_set,
         solana_accounts_db::{
             accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
             accounts_hash::{CalcAccountsHashConfig, HashStats},
@@ -1100,7 +1150,7 @@ mod tests {
                 SnapshotVersion::default(),
                 &snapshot_archives_dir,
                 &snapshot_archives_dir,
-                ArchiveFormat::TarZstd,
+                ArchiveFormat::Tar,
             )
             .unwrap();
 
@@ -1345,7 +1395,7 @@ mod tests {
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let full_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
         let incremental_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
-        let snapshot_archive_format = ArchiveFormat::TarZstd;
+        let snapshot_archive_format = ArchiveFormat::Tar;
 
         let full_snapshot_slot = slot;
         let full_snapshot_archive_info = bank_to_full_snapshot_archive(
@@ -1828,7 +1878,7 @@ mod tests {
             SnapshotVersion::default(),
             &snapshot_archives_dir,
             &snapshot_archives_dir,
-            ArchiveFormat::TarZstd,
+            ArchiveFormat::Tar,
         )
         .unwrap();
 
@@ -1962,12 +2012,27 @@ mod tests {
         let full_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
         let incremental_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
 
-        let genesis_config_info = genesis_utils::create_genesis_config_with_leader(
+        let mut genesis_config_info = genesis_utils::create_genesis_config_with_leader(
             1_000_000 * LAMPORTS_PER_SOL,
             &Pubkey::new_unique(),
             100 * LAMPORTS_PER_SOL,
         );
         let mint = &genesis_config_info.mint_keypair;
+        // When the snapshots lt hash feature is enabled, the IAH is effectively *disabled*,
+        // which causes this test to fail.
+        // Disable the snapshots lt hash feature by removing its account from genesis.
+        genesis_config_info
+            .genesis_config
+            .accounts
+            .remove(&feature_set::snapshots_lt_hash::id())
+            .unwrap();
+        // Additionally, remove the accounts lt hash feature, since it would cause startup
+        // verification to use the accounts lt hash and not the IAH.
+        genesis_config_info
+            .genesis_config
+            .accounts
+            .remove(&feature_set::accounts_lt_hash::id())
+            .unwrap();
 
         let do_transfers = |bank: &Bank| {
             let key1 = Keypair::new(); // lamports from mint
@@ -2117,6 +2182,149 @@ mod tests {
                 HashStats::default(),
             );
         assert_eq!(other_incremental_accounts_hash, incremental_accounts_hash);
+    }
+
+    /// Test that snapshots correctly handle zero lamport accounts
+    ///
+    /// slot 1:
+    ///     - send some lamports to Account1 (from Account2) to bring it to life
+    ///     - Send some lamports to Account3 (from mint) to preserve this slot
+    ///     - Root slot 1 and flush write cache
+    /// slot 2:
+    ///     - make Account1 have zero lamports (send back to Account2)
+    /// slot 3:
+    ///     - remove Account2's reference back to slot 2 by transferring from the mint to Account2
+    ///     - take a full snap shot
+    ///     - verify that recovery from full snapshot does not bring account1 back to life
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_snapshots_handle_zero_lamport_accounts(storage_access: StorageAccess) {
+        let collector = Pubkey::new_unique();
+        let key1 = Keypair::new();
+        let key2 = Keypair::new();
+        let key3 = Keypair::new();
+
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let full_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
+        let snapshot_archive_format = ArchiveFormat::Tar;
+
+        let (genesis_config, mint_keypair) = create_genesis_config(sol_to_lamports(1_000_000.));
+
+        let lamports_to_transfer = sol_to_lamports(123_456.);
+        let bank_test_config = BankTestConfig {
+            accounts_db_config: AccountsDbConfig {
+                storage_access,
+                ..AccountsDbConfig::default()
+            },
+        };
+
+        let bank0 = Bank::new_with_config_for_tests(&genesis_config, bank_test_config);
+
+        let (bank0, bank_forks) = Bank::wrap_with_bank_forks_for_tests(bank0);
+
+        bank0
+            .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
+            .unwrap();
+
+        bank0.fill_bank_with_ticks_for_tests();
+
+        let slot = 1;
+        let bank1 =
+            new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot);
+        bank1
+            .transfer(lamports_to_transfer, &key2, &key1.pubkey())
+            .unwrap();
+        bank1
+            .transfer(lamports_to_transfer, &mint_keypair, &key3.pubkey())
+            .unwrap();
+
+        bank1.fill_bank_with_ticks_for_tests();
+
+        // Force rooting of slot1
+        bank1.squash();
+        bank1.force_flush_accounts_cache();
+
+        let slot = slot + 1;
+        let bank2 =
+            new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank1, &collector, slot);
+        let blockhash = bank2.last_blockhash();
+        let tx = SanitizedTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &key1,
+            &key2.pubkey(),
+            lamports_to_transfer,
+            blockhash,
+        ));
+
+        let fee = bank2.get_fee_for_message(tx.message()).unwrap();
+        bank2
+            .transfer(lamports_to_transfer - fee, &key1, &key2.pubkey())
+            .unwrap();
+
+        assert_eq!(
+            bank2.get_balance(&key1.pubkey()),
+            0,
+            "Ensure Account1's balance is zero"
+        );
+        bank2.fill_bank_with_ticks_for_tests();
+
+        let slot = slot + 1;
+        let bank3 =
+            new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, &collector, slot);
+        // Update Account2 so that it no longer holds a reference to slot2
+        bank3
+            .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
+            .unwrap();
+        bank3.fill_bank_with_ticks_for_tests();
+
+        assert!(
+            bank3.get_account_modified_slot(&key1.pubkey()).is_none(),
+            "Ensure Account1 has been cleaned and purged from AccountsDb"
+        );
+
+        // Take full snapshot and then do a roundtrip on the bank and ensure it
+        // deserializes correctly
+        let full_snapshot_archive_info = bank_to_full_snapshot_archive(
+            bank_snapshots_dir.path(),
+            &bank3,
+            None,
+            full_snapshot_archives_dir.path(),
+            full_snapshot_archives_dir.path(),
+            snapshot_archive_format,
+        )
+        .unwrap();
+
+        let accounts_dir = tempfile::TempDir::new().unwrap();
+        let other_bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let (deserialized_bank, _) = bank_from_snapshot_archives(
+            &[accounts_dir.path().to_path_buf()],
+            other_bank_snapshots_dir.path(),
+            &full_snapshot_archive_info,
+            None,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+
+        deserialized_bank.wait_for_initial_accounts_hash_verification_completed_for_tests();
+
+        assert!(
+            deserialized_bank
+                .get_account_modified_slot(&key1.pubkey())
+                .is_none(),
+            "Ensure Account1 has not been brought back from the dead"
+        );
+
+        assert_eq!(*bank3, deserialized_bank);
     }
 
     #[test_case(StorageAccess::Mmap)]
